@@ -214,7 +214,7 @@ def build_calibration(
         calibration_mode=mode,
         token_count=n,
         sequence_count=len(sequence_lengths),
-        faithful_sequence_count=fairful_count if mode == "supervised" else len(sequence_lengths),
+        faithful_sequence_count=faithful_count if mode == "supervised" else len(sequence_lengths),
         length_summary=_length_summary(sequence_lengths),
         dkw={"confidence": confidence, "epsilon_bound": round(eps, 6)},
         ecdf_values=ecdf_sorted,

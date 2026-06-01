@@ -15,9 +15,21 @@ Tested providers:
 
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Optional, Protocol, runtime_checkable
+
+import numpy as np
+
+from .base import (
+    BaseProvider,
+    CompletionLogprobs,
+    ProviderCapabilityError,
+    ProviderConfig,
+    TokenLogprob,
+    TokenLogprobResult,
+)
 
 try:
     import httpx
@@ -26,8 +38,49 @@ except ImportError:
 
 
 # ---------------------------------------------------------------------------
+# Protocol
+# ---------------------------------------------------------------------------
+
+
+@runtime_checkable
+class TokenLogprobProvider(Protocol):
+    """Protocol for providers that extract token logprobs from generations.
+
+    Implementations must call the underlying API with logprobs enabled,
+    extract per-token logprob data, and compute entropy where possible.
+    """
+
+    def score_generation(
+        self,
+        prompt: str,
+        *,
+        max_tokens: int = 100,
+        messages: Optional[list[dict[str, str]]] = None,
+    ) -> TokenLogprobResult:
+        """Generate text and return logprobs with entropy metrics.
+
+        Args:
+            prompt: User prompt (ignored if messages is provided).
+            max_tokens: Max tokens to generate.
+            messages: Full message list (overrides prompt).
+
+        Returns:
+            TokenLogprobResult with per-token data and entropy where available.
+
+        Raises:
+            ProviderCapabilityError: If logprobs are completely unavailable.
+        """
+        ...
+
+    def check_health(self) -> dict[str, Any]:
+        """Quick health check: can we reach the API and get logprobs?"""
+        ...
+
+
+# ---------------------------------------------------------------------------
 # Provider registry
 # ---------------------------------------------------------------------------
+
 
 @dataclass(frozen=True)
 class ProviderSpec:
@@ -110,47 +163,9 @@ PROVIDER_SPECS: dict[str, ProviderSpec] = {
 
 
 # ---------------------------------------------------------------------------
-# Token logprob data (normalized output)
-# ---------------------------------------------------------------------------
-
-@dataclass
-class TokenLogprob:
-    """Normalized logprob data for a single token position."""
-
-    token: str
-    logprob: float
-    token_id: Optional[int] = None
-    top_logprobs: dict[str, float] = field(default_factory=dict)
-    # top_logprobs maps alternative token text -> logprob
-
-
-@dataclass
-class CompletionLogprobs:
-    """Normalized logprob data for an entire completion."""
-
-    tokens: list[TokenLogprob]
-    provider: str
-    model: str
-    top_k: int  # how many alternatives were returned per position
-    echo_used: bool = False  # whether prompt tokens are included
-
-    @property
-    def selected_logprobs(self) -> list[float]:
-        """Logprobs of the tokens the model actually chose."""
-        return [t.logprob for t in self.tokens]
-
-    @property
-    def topk_logprobs(self) -> list[dict[str, float]]:
-        """Top-k logprob dicts per position (includes selected token)."""
-        return [t.top_logprobs for t in self.tokens]
-
-    def has_top_k(self) -> bool:
-        return self.top_k > 0 and any(t.top_logprobs for t in self.tokens)
-
-
-# ---------------------------------------------------------------------------
 # API caller
 # ---------------------------------------------------------------------------
+
 
 def _call_chat_completions(
     base_url: str,
@@ -197,6 +212,7 @@ def _call_chat_completions(
 # Response parser
 # ---------------------------------------------------------------------------
 
+
 def _parse_openai_logprobs(
     response: dict[str, Any],
     provider_name: str,
@@ -205,7 +221,7 @@ def _parse_openai_logprobs(
 ) -> CompletionLogprobs:
     """Parse an OpenAI-style chat completion response with logprobs."""
     choice = response["choices"][0]
-    logprobs_obj = choice.get("logprobs", {})
+    logprobs_obj = choice.get("logprobs") or {}
     content = logprobs_obj.get("content", [])
 
     tokens: list[TokenLogprob] = []
@@ -219,8 +235,7 @@ def _parse_openai_logprobs(
             lp = alt.get("logprob", 0.0)
             top_dict[tok] = lp
 
-        # The selected token may or may not be in top_logprobs
-        # Always include it
+        # The selected token may or may not be in top_logprobs; always include it
         selected_tok = entry.get("token", "")
         selected_lp = entry.get("logprob", 0.0)
         if selected_tok and selected_tok not in top_dict:
@@ -248,16 +263,25 @@ def _parse_openai_logprobs(
 # High-level API
 # ---------------------------------------------------------------------------
 
+
 @dataclass(frozen=True)
 class OpenAICompatibleProvider:
     """
     High-level provider for OpenAI-compatible chat completions with logprobs.
+
+    Reads api_key, base_url, model from constructor args or environment
+    variables (OPENAI_API_KEY, OPENAI_BASE_URL).  Default top_logprobs=20.
 
     Usage:
         provider = OpenAICompatibleProvider.from_preset("together")
         result = provider.generate("What is the capital of France?")
         print(result.selected_logprobs)
         print(result.topk_logprobs)
+
+        # score_generation returns entropy + perplexity
+        sg = provider.score_generation("Say hello")
+        if sg.has_top_k():
+            print(sg.entropies)
     """
 
     spec: ProviderSpec
@@ -277,14 +301,17 @@ class OpenAICompatibleProvider:
         model: Optional[str] = None,
         base_url: Optional[str] = None,
     ) -> OpenAICompatibleProvider:
-        """Create from a named preset (e.g. 'openai', 'together', 'fireworks')."""
+        """Create from a named preset (e.g. 'openai', 'together', 'fireworks').
+
+        api_key falls back to the env var named in the spec's api_key_env.
+        base_url and model fall back to the spec defaults.
+        """
         spec = PROVIDER_SPECS.get(preset)
         if spec is None:
             raise ValueError(
                 f"Unknown provider preset '{preset}'. "
                 f"Available: {', '.join(PROVIDER_SPECS)}"
             )
-        # Allow overrides
         if model or base_url:
             spec = ProviderSpec(
                 name=spec.name,
@@ -401,6 +428,140 @@ class OpenAICompatibleProvider:
             echo=True,
         )
 
+    def score_generation(
+        self,
+        prompt: str,
+        *,
+        max_tokens: int = 100,
+        messages: Optional[list[dict[str, str]]] = None,
+    ) -> TokenLogprobResult:
+        """Generate text and return logprobs with entropy metrics.
+
+        Requests top_logprobs=20 by default.  Handles three capability levels:
+
+        1. **Full top-k available** -- entropy is computed per token.
+        2. **Only selected-token logprobs** -- perplexity is computed; entropy
+           is unavailable and a warning is emitted.  CES cannot be computed.
+        3. **No logprobs at all** -- raises ProviderCapabilityError.
+
+        Args:
+            prompt: User prompt (ignored if messages is provided).
+            max_tokens: Max tokens to generate.
+            messages: Full message list (overrides prompt).
+
+        Returns:
+            TokenLogprobResult with per-token data and metrics.
+
+        Raises:
+            ProviderCapabilityError: If the API returns no logprob data at all.
+        """
+        if messages is None:
+            messages = [{"role": "user", "content": prompt}]
+
+        # Request top_logprobs=20 (or provider max, whichever is smaller)
+        requested_top_k = min(20, self.spec.max_top_k)
+
+        try:
+            raw = _call_chat_completions(
+                base_url=self.spec.base_url,
+                api_key=self.api_key,
+                model=self.spec.model,
+                messages=messages,
+                max_tokens=max_tokens,
+                top_logprobs=requested_top_k,
+            )
+        except Exception as exc:
+            raise ProviderCapabilityError(
+                f"API call failed for provider '{self.spec.name}': {exc}",
+                provider=self.spec.name,
+            ) from exc
+
+        # Parse response
+        choice = raw["choices"][0]
+        logprobs_obj = choice.get("logprobs")
+        content = (logprobs_obj or {}).get("content", [])
+
+        if not content:
+            raise ProviderCapabilityError(
+                f"Provider '{self.spec.name}' returned no logprob data. "
+                "The model or endpoint may not support logprobs. "
+                "Cannot perform any uncertainty scoring.",
+                capability="logprobs",
+                provider=self.spec.name,
+            )
+
+        # Extract token logprobs
+        tokens: list[TokenLogprob] = []
+        warnings: list[str] = []
+        has_top_k_data = False
+
+        for entry in content:
+            top = entry.get("top_logprobs", [])
+            top_dict: dict[str, float] = {}
+            for alt in top:
+                tok = alt.get("token", "")
+                lp = alt.get("logprob", 0.0)
+                top_dict[tok] = lp
+
+            selected_tok = entry.get("token", "")
+            selected_lp = entry.get("logprob", 0.0)
+            if selected_tok and selected_tok not in top_dict:
+                top_dict[selected_tok] = selected_lp
+
+            if len(top_dict) > 1:
+                has_top_k_data = True
+
+            tokens.append(TokenLogprob(
+                token=selected_tok,
+                logprob=selected_lp,
+                token_id=entry.get("token_id"),
+                top_logprobs=top_dict,
+            ))
+
+        # Determine capability level and compute metrics
+        entropies: Optional[np.ndarray] = None
+        perplexity: Optional[float] = None
+        effective_top_k = 0
+
+        if has_top_k_data:
+            # Full top-k: compute per-token entropy from top-k logprobs
+            effective_top_k = max(len(t.top_logprobs) for t in tokens)
+            per_token_entropies = []
+            for t in tokens:
+                if t.top_logprobs:
+                    probs = np.array(list(t.top_logprobs.values()), dtype=np.float64)
+                    probs = np.exp(probs)
+                    probs = np.clip(probs, 1e-10, None)
+                    probs = probs / probs.sum()
+                    per_token_entropies.append(-float(np.sum(probs * np.log(probs))))
+                else:
+                    per_token_entropies.append(0.0)
+            entropies = np.array(per_token_entropies, dtype=np.float64)
+        else:
+            # Only selected-token logprobs: can compute perplexity, not entropy
+            warnings.append(
+                f"Provider '{self.spec.name}' returned only selected-token logprobs "
+                "(no top-k alternatives).  Entropy cannot be computed; only "
+                "perplexity baseline is available.  CES scoring is not possible."
+            )
+
+        # Always compute perplexity when we have selected-token logprobs
+        if tokens:
+            sel_logprobs = np.array(
+                [t.logprob for t in tokens], dtype=np.float64
+            )
+            perplexity = float(np.exp(-np.mean(sel_logprobs)))
+
+        return TokenLogprobResult(
+            token_logprobs=tokens,
+            entropies=entropies,
+            perplexity=perplexity,
+            provider=self.spec.name,
+            model=self.spec.model,
+            top_k=effective_top_k,
+            warnings=warnings,
+        )
+
     def check_health(self) -> dict[str, Any]:
         """Quick health check: can we reach the API and get logprobs?"""
         try:
@@ -418,3 +579,93 @@ class OpenAICompatibleProvider:
                 "provider": self.spec.name,
                 "error": str(e),
             }
+
+
+# ---------------------------------------------------------------------------
+# Standalone smoke test
+# ---------------------------------------------------------------------------
+
+
+def smoke_provider(
+    *,
+    api_key: Optional[str] = None,
+    base_url: Optional[str] = None,
+    model: Optional[str] = None,
+    provider: str = "openai",
+) -> dict[str, Any]:
+    """Run a smoke test on a provider to check logprob capabilities.
+
+    Makes a minimal generation and reports what capabilities are available.
+
+    Args:
+        api_key: API key (falls back to env var for the preset).
+        base_url: Base URL override.
+        model: Model override.
+        provider: Provider preset name.
+
+    Returns:
+        Dict with status, capabilities, and any warnings or errors.
+
+    Raises:
+        ProviderCapabilityError: If logprobs are completely unavailable.
+    """
+    prov = OpenAICompatibleProvider.from_preset(
+        provider,
+        api_key=api_key,
+        base_url=base_url,
+        model=model,
+    )
+
+    result: dict[str, Any] = {
+        "provider": prov.spec.name,
+        "preset": provider,
+        "base_url": base_url or prov.spec.base_url,
+        "model": model or prov.spec.model,
+        "status": "PASS",
+        "capabilities": {
+            "logprobs_available": False,
+            "top_k_logprobs": False,
+            "max_top_k": 0,
+            "echo_supported": prov.spec.echo_supported,
+        },
+        "warnings": [],
+    }
+
+    # Step 1: Basic health check
+    health = prov.check_health()
+    if not health.get("healthy"):
+        result["status"] = "FAIL"
+        result["error"] = health.get("error", "Unknown error")
+        raise ProviderCapabilityError(
+            f"Provider '{prov.spec.name}' health check failed: {result['error']}",
+            capability="logprobs",
+            provider=prov.spec.name,
+        )
+
+    # Step 2: score_generation to check full capability
+    try:
+        sg = prov.score_generation("Say OK", max_tokens=2)
+        result["capabilities"]["logprobs_available"] = True
+
+        if sg.has_top_k():
+            result["capabilities"]["top_k_logprobs"] = True
+            result["capabilities"]["max_top_k"] = sg.top_k
+        else:
+            result["capabilities"]["top_k_logprobs"] = False
+            result["capabilities"]["max_top_k"] = 0
+            result["warnings"].extend(sg.warnings)
+            result["warnings"].append(
+                "CES scoring not available: only selected-token logprobs returned."
+            )
+
+    except ProviderCapabilityError:
+        raise
+    except Exception as exc:
+        result["status"] = "FAIL"
+        result["error"] = str(exc)
+        raise ProviderCapabilityError(
+            f"Smoke test failed for '{prov.spec.name}': {exc}",
+            provider=prov.spec.name,
+        ) from exc
+
+    return result

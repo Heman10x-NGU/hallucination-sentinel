@@ -1,131 +1,265 @@
 # Hallucination Sentinel
 
-**Detect LLM hallucinations using entropy analysis.**
+**Single-pass uncertainty firewall for LLM outputs.**
 
-Single forward pass. Black-box. Works with any model.
+Flags generations whose entropy profile looks inconsistent with calibrated
+faithful outputs. Uses the Calibrated Entropy Score (CES) algorithm from
+["Entropy Distribution as a Fingerprint for Hallucinations in Generative Models"](https://arxiv.org/abs/2605.28264)
+(Villani et al., 2026).
 
-Based on ["Entropy Distribution as a Fingerprint for Hallucinations in Generative Models"](https://arxiv.org/abs/2605.28264) — the Calibrated Entropy Score (CES) algorithm.
+---
 
-## Why This Exists
+> **This is a risk signal, not a truth oracle.** The CES score is NOT a
+> hallucination probability. A low score does not prove text is correct.
+> A high score does not prove text is wrong. Read [Limitations](#limitations)
+> before using this in production.
 
-LLMs generate confident-sounding but factually wrong text. You can't tell the difference without manual verification.
+---
 
-**Hallucination Sentinel** analyzes the entropy (uncertainty) of token probabilities. Hallucinated text has higher entropy because the model is "guessing" rather than "knowing."
+## What This Does
+
+1. Takes per-token log probabilities from an LLM (via API or local model)
+2. Computes Shannon entropy at each token position
+3. Compares the entropy profile against a calibrated reference distribution
+4. Returns a CES ranking score and risk level (LOW / MEDIUM / HIGH / CRITICAL)
+5. Optionally routes the output through a policy engine (allow / warn / block)
+
+## What This Does NOT Do
+
+- Detect hallucinations with certainty
+- Work without logprobs or logits from the model
+- Fact-check claims against external sources
+- Guarantee that LOW-risk outputs are correct
+- Catch confident falsehoods (low entropy = high confidence, even when wrong)
+
+## Requirements
+
+**Logprobs are mandatory.** The provider must expose token-level log
+probabilities. See [Provider Compatibility](docs/provider_logprobs.md) for a
+provider-by-provider table.
+
+The core library requires Python >= 3.10, numpy, scipy, click, and rich.
 
 ## Quick Start
 
+### Install
+
 ```bash
-# Install
 pip install hallucination-sentinel
 
-# Check text (demo mode)
-hallucination-sentinel check "The capital of France is Berlin"
-# Output: ⚠️ HALLUCINATION RISK: 0.87 (HIGH)
+# With OpenAI provider support
+pip install hallucination-sentinel[openai]
 
-# Check with OpenAI API
-export OPENAI_API_KEY=your-key
-hallucination-sentinel check --api openai "Your LLM output here"
+# With HuggingFace local model support
+pip install hallucination-sentinel[huggingface]
 
-# Check with local model
-hallucination-sentinel check --model meta-llama/Llama-3-8B "Your text here"
+# Everything
+pip install hallucination-sentinel[all]
 ```
 
-## How It Works
+### Offline Demo (no API key needed)
 
-1. **Get token probabilities** from LLM (via API or local model)
-2. **Calculate entropy** per token
-3. **Compute CES score** (geometric mean of mean + max entropy, calibrated)
-4. **Flag high-entropy segments** (potential hallucinations)
+Run the full pipeline offline using pre-computed entropy sequences:
 
-The CES algorithm:
-- Requires only a **single forward pass**
-- Works with **black-box access** (just needs logprobs)
-- Provides **formal statistical guarantees**
-- Matches multi-sample methods at **1/10th the cost**
+```bash
+# 1. Create a toy calibration dataset
+echo '{"entropy": [0.1, 0.2, 0.15, 0.3, 0.1, 0.2]}' > cal.jsonl
+echo '{"entropy": [0.15, 0.25, 0.2, 0.18, 0.12, 0.22]}' >> cal.jsonl
 
-## Output Format
+# 2. Build a calibration artifact
+sentinel calibrate --input cal.jsonl --output calibration.json
+
+# 3. Score a pre-computed entropy sequence
+echo '{"entropy": [0.5, 1.2, 2.8, 3.5, 2.1, 0.8]}' > score_input.json
+sentinel score --entropy-json score_input.json --calibration calibration.json
+```
+
+Output:
 
 ```json
 {
-  "text": "The capital of France is Berlin",
-  "ces_score": 0.87,
-  "risk_level": "HIGH",
-  "flagged_tokens": [
-    {
-      "token": "Berlin",
-      "entropy": 2.34,
-      "position": 7
-    }
-  ],
-  "mean_entropy": 1.23,
-  "max_entropy": 2.34,
-  "token_count": 7
+  "ces_score": 0.954321,
+  "risk_level": "CRITICAL",
+  "cdf_mean": 0.98,
+  "cdf_max": 0.93,
+  "mean_entropy": 1.816667,
+  "max_entropy": 3.5,
+  "token_count": 6,
+  "warnings": [
+    "short_text: only 6 tokens.  CES reliability degrades for very short generations."
+  ]
 }
 ```
 
-## Supported Backends
+### Real Provider Smoke Test
 
-| Backend | Status | Notes |
-|---------|--------|-------|
-| OpenAI API | ✅ | Uses logprobs |
-| HuggingFace | ✅ | Local models |
-| Ollama | 🔜 | Coming soon |
-| Azure OpenAI | 🔜 | Coming soon |
+Test whether a provider supports logprobs before relying on it:
 
-## Use Cases
+```bash
+# Test OpenAI
+export OPENAI_API_KEY=sk-...
+sentinel smoke-provider --provider openai
 
-- **Quality assurance** — Check LLM outputs before publishing
-- **RAG validation** — Verify retrieved context is used correctly
-- **Agent trust** — Flag uncertain agent actions (Daemons integration)
-- **Content moderation** — Detect AI-generated misinformation
+# Test Together AI
+export TOGETHER_API_KEY=...
+sentinel smoke-provider --provider together
 
-## Daemons Integration
-
-Hallucination Sentinel is the trust layer for [Daemons](https://github.com/Heman10x-NGU/daemons) AI agents.
-
-```python
-from hallucination_sentinel import check
-
-# Daemon agent generates output
-output = daemon_agent.generate("Write a report about Q3 sales")
-
-# Check for hallucinations
-result = check(output)
-
-if result.risk_level == "HIGH":
-    # Don't execute — flag for human review
-    human_review(output, result)
-else:
-    # Execute action
-    execute_action(output)
+# Test a local vLLM server
+sentinel smoke-provider --provider vllm --base-url http://localhost:8000/v1
 ```
 
-## The Algorithm
+The smoke test reports whether logprobs, top-k alternatives, and echo-based
+text scoring are available.
 
-CES = f(mean entropy, max entropy)
+### Score With a Real Provider
 
-Where:
-- **Mean entropy** = average uncertainty across all tokens
-- **Max entropy** = peak uncertainty (tail of distribution)
-- **CES** = geometric mean, calibrated against reference CDF
+After the smoke test passes:
 
-The key insight: **the shape of the entropy distribution matters, not just the mean.**
+```bash
+sentinel score-provider \
+  --prompt prompt.txt \
+  --output output.txt \
+  --provider together \
+  --model meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo \
+  --calibration calibration.json
+```
 
-Hallucinated text has:
-- Higher mean entropy (model is uncertain)
-- Higher max entropy (model is "guessing" on specific tokens)
-- Different distribution shape (fatter tails)
+## CLI Commands
+
+| Command | Description |
+|---------|-------------|
+| `sentinel calibrate` | Build calibration artifact from JSONL entropy data |
+| `sentinel inspect-calibration` | Print calibration metadata |
+| `sentinel score` | Score a pre-computed entropy sequence (offline) |
+| `sentinel score-provider` | Score text using a provider's logprobs |
+| `sentinel eval` | Evaluate CES against baseline metrics on labeled data |
+| `sentinel smoke-provider` | Test provider logprob support |
+
+## Python API
+
+```python
+import numpy as np
+from hallucination_sentinel import compute_ces, load_calibration
+
+# Load calibration
+artifact = load_calibration("calibration.json")
+
+# Score from entropy sequence
+entropies = np.array([0.5, 1.2, 2.8, 3.5, 2.1, 0.8])
+result = compute_ces(entropies, artifact)
+
+print(result.ces_score)      # 0.954321 (ranking score, NOT probability)
+print(result.risk_level)      # "CRITICAL"
+print(result.mean_entropy)    # 1.816667
+print(result.max_entropy)     # 3.5
+print(result.warnings)        # ["short_text: only 6 tokens..."]
+```
+
+## Middleware / Integration
+
+Gate LLM outputs before your agent or RAG system acts on them:
+
+```python
+from hallucination_sentinel.calibration import load_calibration
+from hallucination_sentinel.integrations import (
+    guard_output,
+    TaskCriticality,
+    PolicyAction,
+)
+
+calibration = load_calibration("calibration.json")
+
+decision = guard_output(
+    prompt="What is the capital of France?",
+    output="The capital of France is Berlin.",
+    calibration=calibration,
+    provider="openai",
+    policy=TaskCriticality.HIGH,
+)
+
+print(decision.action)        # PolicyAction.REQUIRE_EVIDENCE
+print(decision.risk_level)    # RiskLevel.HIGH
+print(decision.ces_score)     # 0.87 (NOT a probability)
+print(decision.diagnostic_peaks)  # entropy regions that drove the score up
+```
+
+See `examples/` for:
+- `batch_qa_monitor.py` -- batch QA monitoring with summary report
+- `rag_answer_gate.py` -- RAG pipeline with hallucination gate
+- `agent_tool_preflight.py` -- agent tool-call preflight check
 
 ## Limitations
 
-- **AUROC ~0.65** — Not perfect, but matches state-of-the-art
-- **Short texts** — Works best with >10 tokens
-- **Logprobs required** — Some APIs don't expose token probabilities
-- **Calibration needed** — Reference distributions required for best results
+**Read this section before deploying.** Full details: [docs/limitations.md](docs/limitations.md)
 
-## Contributing
+| Limitation | Impact |
+|-----------|--------|
+| **CES is NOT a probability** | `ces_score = 0.87` means "more extreme than 87% of reference", not "87% chance of hallucination" |
+| **Logprobs required** | Cannot work with providers that do not expose token probabilities |
+| **Short text unreliable** | Below ~10 tokens, CES has insufficient statistical signal |
+| **Confident errors evade detection** | If the model is certain about a wrong answer, entropy is low and CES is low |
+| **AUROC ~0.65** | Matches state-of-the-art single-pass methods but is not perfect |
+| **Domain shift** | Calibration is tied to model + provider + task + decoding config |
+| **Top-k is approximate** | Entropy from top-k logprobs is a lower bound on true entropy |
+| **Not a fact-checker** | Measures model uncertainty, not factual correctness |
+| **Diagnostic peaks are not hallucinated spans** | High-entropy regions are flagged as "local_entropy_peak", never as "hallucinated" |
 
-Contributions welcome! See [CONTRIBUTING.md](CONTRIBUTING.md).
+## Calibration
+
+Calibration builds a reference entropy distribution for your specific model,
+task, and decoding configuration. See [docs/calibration.md](docs/calibration.md).
+
+```bash
+# Unsupervised (no labels needed)
+sentinel calibrate --input data.jsonl --output cal.json --mode unsupervised
+
+# Supervised (only faithful sequences used for reference)
+sentinel calibrate --input data.jsonl --output cal.json --mode supervised
+```
+
+## Provider Compatibility
+
+Hallucination Sentinel works with any provider that exposes token logprobs
+through an OpenAI-compatible API. See [docs/provider_logprobs.md](docs/provider_logprobs.md).
+
+**Tested providers:** OpenAI, Together AI, Fireworks AI, DeepSeek, vLLM
+
+**Experimental:** Ollama (limited, evolving)
+
+**No logprob support:** Groq (schema accepts logprobs but no models return them)
+
+## Evaluation
+
+Run CES against labeled data with baseline comparisons:
+
+```bash
+sentinel eval --input eval.jsonl --calibration calibration.json --output report.json
+```
+
+The eval report includes:
+- AUROC / AUPRC with bootstrap confidence intervals
+- Confusion matrices at configured thresholds
+- Baseline comparisons (perplexity, mean entropy, generation length)
+- Per-length-bucket calibration coverage
+- Lag-1 autocorrelation diagnostics
+
+## Architecture
+
+```
+LLM output (text + logprobs)
+    |
+    v
+Entropy computation (per-token Shannon entropy)
+    |
+    v
+CES scoring (geometric mean of F0(mean) and F0(max))
+    |
+    v
+Threshold assignment (quantile or supervised)
+    |
+    v
+Routing decision (allow / warn / require_evidence / human_review / block)
+```
 
 ## License
 
@@ -146,4 +280,3 @@ MIT
 
 - [Kurate.org](https://kurate.org) for paper rankings
 - The CES paper authors for the algorithm
-- The open source community for inspiration
