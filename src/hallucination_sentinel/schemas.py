@@ -39,6 +39,10 @@ def parse_label(value: object, *, context: str = "") -> ParsedLabel:
     * **str** -- ``"faithful"`` → faithful, ``"hallucinated"`` → hallucinated
       (case-insensitive, whitespace stripped).
 
+    For eval JSONL, also supports ``is_hallucinated`` field:
+      - ``is_hallucinated: true`` → hallucinated
+      - ``is_hallucinated: false`` → faithful
+
     Args:
         value: Raw label from JSONL or CLI.
         context: Optional diagnostic string included in error messages.
@@ -76,6 +80,39 @@ def parse_label(value: object, *, context: str = "") -> ParsedLabel:
 
     raise ValueError(
         f"Unsupported label type {type(value).__name__}: {value!r}"
+        f"{' (' + context + ')' if context else ''}"
+    )
+
+
+def parse_label_from_record(obj: dict, *, context: str = "") -> ParsedLabel:
+    """Parse label from a JSONL record, supporting both 'label' and 'is_hallucinated' fields.
+
+    Priority:
+    1. If 'is_hallucinated' exists, use it (bool: true → hallucinated, false → faithful)
+    2. If 'label' exists, use parse_label()
+    3. Otherwise, raise ValueError
+
+    Args:
+        obj: Parsed JSON dict from JSONL.
+        context: Optional diagnostic string for error messages.
+
+    Returns:
+        A :class:`ParsedLabel` with exactly one flag set.
+    """
+    if "is_hallucinated" in obj:
+        is_hall = obj["is_hallucinated"]
+        if isinstance(is_hall, bool):
+            return ParsedLabel(faithful=not is_hall, hallucinated=is_hall)
+        raise ValueError(
+            f"is_hallucinated must be boolean, got {type(is_hall).__name__}: {is_hall!r}"
+            f"{' (' + context + ')' if context else ''}"
+        )
+
+    if "label" in obj:
+        return parse_label(obj["label"], context=context)
+
+    raise ValueError(
+        f"Record must have either 'label' or 'is_hallucinated' field"
         f"{' (' + context + ')' if context else ''}"
     )
 

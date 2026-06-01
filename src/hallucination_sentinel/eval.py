@@ -19,7 +19,7 @@ from typing import Any, Optional
 
 import numpy as np
 
-from .schemas import parse_label
+from .schemas import parse_label, parse_label_from_record
 
 # Optional sklearn dependency
 try:
@@ -96,13 +96,19 @@ def load_eval_data(path: str | Path) -> list[EvalRecord]:
             except json.JSONDecodeError as exc:
                 raise ValueError(f"Invalid JSON on line {lineno}: {exc}") from exc
 
-            missing = {"ces_score", "label", "token_count", "token_entropies"} - obj.keys()
+            # Check for required fields (label or is_hallucinated)
+            required = {"ces_score", "token_count", "token_entropies"}
+            missing = required - obj.keys()
             if missing:
                 raise ValueError(
                     f"Line {lineno}: missing required fields: {sorted(missing)}"
                 )
+            if "label" not in obj and "is_hallucinated" not in obj:
+                raise ValueError(
+                    f"Line {lineno}: must have either 'label' or 'is_hallucinated' field"
+                )
 
-            parsed = parse_label(obj["label"], context=f"eval line {lineno}")
+            parsed = parse_label_from_record(obj, context=f"eval line {lineno}")
 
             records.append(
                 EvalRecord(
@@ -157,7 +163,7 @@ def normalize_to_eval_record(
     Raises:
         ValueError: If required fields are missing or invalid.
     """
-    parsed = parse_label(obj.get("label"), context=f"eval line {lineno}")
+    parsed = parse_label_from_record(obj, context=f"eval line {lineno}")
 
     # Pre-scored row: has ces_score already
     if "ces_score" in obj:
@@ -623,6 +629,8 @@ class EvalReport:
         n_positive: Number of hallucination samples (label=1).
         n_negative: Number of faithful samples (label=0).
         hallucination_rate: Fraction of positive samples.
+        positive_class: Name of the positive class ("hallucinated").
+        label_schema: Description of label format used.
         auroc: Area under ROC curve (CES).
         auprc: Area under precision-recall curve (CES).
         confusion_matrices: Confusion metrics at configured thresholds.
@@ -639,6 +647,8 @@ class EvalReport:
     n_positive: int = 0
     n_negative: int = 0
     hallucination_rate: float = 0.0
+    positive_class: str = "hallucinated"
+    label_schema: str = "label: faithful|hallucinated or is_hallucinated: bool"
 
     # Primary metrics (CES)
     auroc: Optional[float] = None
@@ -828,6 +838,8 @@ def report_to_json(report: EvalReport) -> str:
     data: dict[str, Any] = {
         "method": report.method,
         "created_at": report.created_at,
+        "positive_class": report.positive_class,
+        "label_schema": report.label_schema,
         "dataset": {
             "n_samples": report.n_samples,
             "n_positive": report.n_positive,

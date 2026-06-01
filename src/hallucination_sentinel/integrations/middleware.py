@@ -351,9 +351,16 @@ def guard_output_with_logprobs(
         entropy_result = entropy_from_topk_logprobs(topk, logprobs.top_k)
         entropies = entropy_result.entropies
     else:
-        # Fallback: use selected-token logprobs as a proxy
-        selected = np.array(logprobs.selected_logprobs, dtype=np.float64)
-        entropies = -selected  # negative logprob ≈ surprise
+        # Selected-token-only logprobs cannot compute proper entropy for CES
+        raise ProviderCapabilityError(
+            "guard_output_with_logprobs() requires top-k logprobs to compute "
+            "token entropy for CES scoring. Selected-token-only logprobs are "
+            "insufficient. Use a provider that returns top-k logprobs (e.g. "
+            "OpenAI with top_logprobs=20), or use guard_output_from_entropies() "
+            "with pre-computed entropy sequences.",
+            capability="top_k_logprobs",
+            provider=provider,
+        )
 
     ces_result = compute_ces(entropies, calibration)
     risk_level = RiskLevel(ces_result.risk_level.lower())

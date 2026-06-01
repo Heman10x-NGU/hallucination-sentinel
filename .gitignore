@@ -18,3 +18,6 @@ venv/
 *.jsonl
 !tests/**/*.jsonl
 .DS_Store
+
+# Local planning docs (not for public repo)
+PLAN*.md
