@@ -288,3 +288,10 @@ MIT
 
 This project is an independent implementation of the Calibrated Entropy Score
 method described by Villani et al. in the paper cited above.
+
+## Contact
+
+For bugs or feature requests, please open a GitHub issue.
+
+For research, product, or collaboration inquiries, reach out on
+[LinkedIn](https://www.linkedin.com/in/heman10x/).
