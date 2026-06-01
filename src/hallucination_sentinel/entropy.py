@@ -24,7 +24,7 @@ class EntropyResult:
 
     # Core entropy values
     entropy: float  # Shannon entropy in nats
-    entropies: np.ndarray  # Per-token entropy values
+    entropies: Optional[np.ndarray]  # Per-token entropy (None for selected_only)
 
     # Metadata
     entropy_mode: str  # "full" | "top_k" | "top_k_with_residual" | "selected_only"
@@ -288,7 +288,11 @@ def compute_token_entropies(
         base: Logarithm base
 
     Returns:
-        EntropyResult with all entropy values and metadata
+        EntropyResult with all entropy values and metadata.
+
+        When only selected-token logprobs are available (no full or top-k
+        distributions), ``entropy_mode`` is ``"selected_only"`` and
+        ``entropies`` is ``None``.  Callers MUST NOT feed this into CES.
 
     Raises:
         ValueError: If token_data is empty or contains invalid entries
@@ -298,43 +302,68 @@ def compute_token_entropies(
 
     entropies = []
     warnings = []
+    selected_only_count = 0
 
     for token_info in token_data:
-        if "logprobs" in token_info and token_info["logprobs"]:
+        if "logprobs" in token_info and len(token_info["logprobs"]) > 0:
             # Full logprobs available
             logprobs = token_info["logprobs"]
             entropy = entropy_from_logprobs(logprobs, base)
             entropies.append(entropy)
-        elif "top_logprobs" in token_info and token_info["top_logprobs"]:
+        elif "top_logprobs" in token_info and len(token_info["top_logprobs"]) > 0:
             # Top-k logprobs available
             topk = token_info["top_logprobs"]
             result = entropy_from_topk_logprobs([topk], len(topk), base)
             entropies.append(result.entropy)
         elif "selected_logprob" in token_info:
-            # Only selected token logprob (not enough for CES)
-            warnings.append(
-                "Only selected-token logprob available. "
-                "Cannot compute token entropy for CES. "
-                "Use perplexity baseline only."
-            )
-            # Use 0 as placeholder (will be filtered)
-            entropies.append(0.0)
+            # Only selected token logprob -- insufficient for entropy.
+            # Do NOT append a 0.0 placeholder; count instead.
+            selected_only_count += 1
         else:
             raise ValueError(f"Unknown token data format: {token_info.keys()}")
 
-    if not entropies:
-        raise ValueError("No valid token data found")
-
-    # Determine mode
+    # Determine mode from actual keys present in the data.
     if entropy_mode == "auto":
-        if "full" in [t.get("mode", "") for t in token_data]:
+        has_full = any(
+            "logprobs" in t and len(t["logprobs"]) > 0 for t in token_data
+        )
+        has_topk = any(
+            "top_logprobs" in t and len(t["top_logprobs"]) > 0 for t in token_data
+        )
+        if has_full:
             mode = "full"
-        elif "top_k" in [t.get("mode", "") for t in token_data]:
+        elif has_topk:
             mode = "top_k"
         else:
-            mode = "unknown"
+            mode = "selected_only"
     else:
         mode = entropy_mode
+
+    # If the resolved mode is selected_only, return entropies=None so that
+    # CES callers cannot accidentally consume placeholder zeros.
+    if mode == "selected_only":
+        if selected_only_count == 0:
+            # Caller forced selected_only but no selected_logprob keys exist.
+            raise ValueError(
+                "entropy_mode='selected_only' requested but no "
+                "'selected_logprob' keys found in token_data"
+            )
+        warnings.append(
+            "Only selected-token logprobs available. "
+            "Cannot compute per-token entropy for CES. "
+            "Use perplexity baseline only."
+        )
+        return EntropyResult(
+            entropy=0.0,
+            entropies=None,
+            entropy_mode="selected_only",
+            entropy_base=base,
+            token_count=len(token_data),
+            warnings=warnings,
+        )
+
+    if not entropies:
+        raise ValueError("No valid token data found")
 
     return EntropyResult(
         entropy=float(np.mean(entropies)),

@@ -26,6 +26,37 @@ If your provider does not expose logprobs at all, this tool has no signal
 to work with. There is no text-only fallback that produces meaningful
 uncertainty estimates.
 
+### Text-only heuristic removed from production flow
+
+The `guard_output()` function previously included a text-only heuristic that
+estimated entropy from token length, digits, and capitalization patterns. This
+heuristic has been **removed from the production flow** because it does not
+produce meaningful uncertainty estimates.
+
+**Current behavior:**
+- `guard_output()` now raises `ProviderCapabilityError` when called without
+  real logprobs from a provider.
+- `guard_output_from_entropies()` is the offline/batch path for pre-computed
+  entropy sequences.
+- `guard_output_with_logprobs()` is the provider path for pre-fetched logprobs.
+- `guard_output_with_text_heuristic_experimental()` preserves the old heuristic
+  for offline experimentation only, with a deprecation warning.
+
+**Migration guide:**
+```python
+# OLD (no longer works):
+decision = guard_output(prompt, output, calibration=cal)
+
+# NEW - with pre-computed entropy:
+decision = guard_output_from_entropies(prompt, output, entropies, calibration=cal)
+
+# NEW - with provider logprobs:
+decision = guard_output_with_logprobs(prompt, output, logprobs, calibration=cal)
+
+# EXPERIMENTAL ONLY (not for production):
+decision = guard_output_with_text_heuristic_experimental(prompt, output, calibration=cal)
+```
+
 See [provider_logprobs.md](./provider_logprobs.md) for a provider-by-provider
 compatibility table.
 

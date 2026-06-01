@@ -11,6 +11,7 @@ import pytest
 from hallucination_sentinel.entropy import (
     EPSILON,
     EntropyResult,
+    compute_token_entropies,
     entropy_from_logprobs,
     entropy_from_probs,
     entropy_from_topk_logprobs,
@@ -433,3 +434,176 @@ class TestEntropyResult:
         assert result.top_k == 5
         assert result.observed_mass_mean == 0.95
         assert result.warnings == ["test warning"]
+
+    def test_entropies_can_be_none(self):
+        """EntropyResult allows entropies=None for selected_only mode."""
+        result = EntropyResult(
+            entropy=0.0,
+            entropies=None,
+            entropy_mode="selected_only",
+            entropy_base="e",
+            token_count=3,
+        )
+        assert result.entropies is None
+        assert result.entropy_mode == "selected_only"
+
+
+# ---------------------------------------------------------------------------
+# compute_token_entropies
+# ---------------------------------------------------------------------------
+class TestComputeTokenEntropies:
+    """Tests for compute_token_entropies."""
+
+    # --- mode detection ---
+
+    def test_full_mode_from_logprobs(self):
+        """Auto-detects 'full' mode when logprobs key is present."""
+        token_data = [
+            {"logprobs": np.array([-0.5, -1.0, -1.5])},
+            {"logprobs": np.array([-0.2, -2.0, -0.8])},
+        ]
+        result = compute_token_entropies(token_data)
+        assert result.entropy_mode == "full"
+        assert result.entropies is not None
+        assert len(result.entropies) == 2
+
+    def test_top_k_mode_from_top_logprobs(self):
+        """Auto-detects 'top_k' mode when top_logprobs key is present."""
+        token_data = [
+            {"top_logprobs": {"a": np.log(0.5), "b": np.log(0.3), "c": np.log(0.2)}},
+            {"top_logprobs": {"x": np.log(0.9), "y": np.log(0.1)}},
+        ]
+        result = compute_token_entropies(token_data)
+        assert result.entropy_mode == "top_k"
+        assert result.entropies is not None
+        assert len(result.entropies) == 2
+
+    def test_selected_only_mode_returns_none_entropies(self):
+        """selected_only mode returns entropies=None, not placeholder zeros."""
+        token_data = [
+            {"selected_logprob": -0.5},
+            {"selected_logprob": -1.2},
+            {"selected_logprob": -0.8},
+        ]
+        result = compute_token_entropies(token_data)
+        assert result.entropy_mode == "selected_only"
+        assert result.entropies is None
+        assert result.entropy == 0.0
+        assert result.token_count == 3
+        assert len(result.warnings) > 0
+        assert "selected" in result.warnings[0].lower()
+
+    def test_selected_only_no_placeholder_zeros(self):
+        """Selected-only result must not contain any 0.0 placeholder values."""
+        token_data = [
+            {"selected_logprob": -0.5},
+            {"selected_logprob": -1.2},
+        ]
+        result = compute_token_entropies(token_data)
+        # entropies is None, not an array of zeros
+        assert result.entropies is None
+
+    def test_mixed_full_and_selected_prefers_full(self):
+        """When some tokens have full logprobs, mode is 'full'."""
+        token_data = [
+            {"logprobs": np.array([-0.5, -1.0, -1.5])},
+            {"selected_logprob": -1.2},
+        ]
+        result = compute_token_entropies(token_data)
+        assert result.entropy_mode == "full"
+        # Only the full-logprob token contributes an entropy value
+        assert result.entropies is not None
+        assert len(result.entropies) == 1
+
+    def test_mixed_topk_and_selected_prefers_topk(self):
+        """When some tokens have top_logprobs, mode is 'top_k'."""
+        token_data = [
+            {"top_logprobs": {"a": np.log(0.5), "b": np.log(0.5)}},
+            {"selected_logprob": -0.8},
+        ]
+        result = compute_token_entropies(token_data)
+        assert result.entropy_mode == "top_k"
+        assert result.entropies is not None
+        assert len(result.entropies) == 1
+
+    # --- forced mode ---
+
+    def test_forced_selected_only_mode(self):
+        """Explicit entropy_mode='selected_only' works with selected_logprob keys."""
+        token_data = [
+            {"selected_logprob": -0.5},
+        ]
+        result = compute_token_entropies(token_data, entropy_mode="selected_only")
+        assert result.entropy_mode == "selected_only"
+        assert result.entropies is None
+
+    def test_forced_selected_only_without_keys_raises(self):
+        """entropy_mode='selected_only' without selected_logprob keys raises."""
+        token_data = [
+            {"logprobs": np.array([-0.5, -1.0])},
+        ]
+        with pytest.raises(ValueError, match="selected_only"):
+            compute_token_entropies(token_data, entropy_mode="selected_only")
+
+    # --- CES safety ---
+
+    def test_selected_only_cannot_feed_ces(self):
+        """entropies=None prevents accidental CES computation."""
+        token_data = [
+            {"selected_logprob": -0.5},
+            {"selected_logprob": -1.2},
+        ]
+        result = compute_token_entropies(token_data)
+        # A caller that tries np.mean(result.entropies) will get an error
+        assert result.entropies is None
+        # Verify: CES requires non-empty array
+        with pytest.raises((TypeError, ValueError)):
+            np.mean(result.entropies)
+
+    def test_full_mode_entropies_are_positive(self):
+        """Full-mode entropies are valid, non-zero floats."""
+        token_data = [
+            {"logprobs": np.array([-0.5, -1.0, -1.5])},
+            {"logprobs": np.array([-0.2, -2.0, -0.8])},
+        ]
+        result = compute_token_entropies(token_data)
+        assert result.entropies is not None
+        assert all(e > 0 for e in result.entropies)
+
+    def test_top_k_mode_entropies_are_positive(self):
+        """Top-k-mode entropies are valid, non-zero floats."""
+        token_data = [
+            {"top_logprobs": {"a": np.log(0.5), "b": np.log(0.3), "c": np.log(0.2)}},
+        ]
+        result = compute_token_entropies(token_data)
+        assert result.entropies is not None
+        assert all(e > 0 for e in result.entropies)
+
+    # --- error cases ---
+
+    def test_empty_token_data_raises(self):
+        """Empty token_data raises ValueError."""
+        with pytest.raises(ValueError, match="non-empty"):
+            compute_token_entropies([])
+
+    def test_unknown_format_raises(self):
+        """Token data with unknown keys raises ValueError."""
+        token_data = [{"unknown_key": 42}]
+        with pytest.raises(ValueError, match="Unknown token data format"):
+            compute_token_entropies(token_data)
+
+    def test_base2_mode(self):
+        """Base-2 entropy mode is propagated."""
+        token_data = [
+            {"logprobs": np.array([-0.5, -1.0, -1.5])},
+        ]
+        result = compute_token_entropies(token_data, base="2")
+        assert result.entropy_base == "2"
+
+    def test_selected_only_warning_message(self):
+        """Warning message explains that CES cannot be computed."""
+        token_data = [
+            {"selected_logprob": -0.5},
+        ]
+        result = compute_token_entropies(token_data)
+        assert any("CES" in w for w in result.warnings)

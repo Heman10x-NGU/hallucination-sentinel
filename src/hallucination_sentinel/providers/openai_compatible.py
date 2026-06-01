@@ -159,6 +159,15 @@ PROVIDER_SPECS: dict[str, ProviderSpec] = {
         echo_supported=False,
         notes="Schema accepts logprobs but NO models support them yet.",
     ),
+    "mimo": ProviderSpec(
+        name="MIMO",
+        base_url="http://localhost:8080/v1",
+        api_key_env="MIMO_API_KEY",
+        model="mimo-v2.5-pro",
+        max_top_k=20,
+        echo_supported=False,
+        notes="OpenAI-compatible if MIMO endpoint exposes /chat/completions with logprobs.",
+    ),
 }
 
 
@@ -193,10 +202,9 @@ def _call_chat_completions(
     if extra_body:
         body.update(extra_body)
 
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {api_key}",
-    }
+    headers: dict[str, str] = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
 
     resp = httpx.post(
         f"{base_url}/chat/completions",
@@ -428,6 +436,72 @@ class OpenAICompatibleProvider:
             echo=True,
         )
 
+    def generate_with_logprobs(
+        self,
+        prompt: str,
+        *,
+        max_tokens: int = 100,
+        top_k: Optional[int] = None,
+    ) -> CompletionLogprobs:
+        """Generate text from prompt and return logprobs for generated tokens.
+
+        Focused variant of generate() without echo/teacher-forcing.
+        Use score_output() to score a specific output against a prompt.
+
+        Args:
+            prompt: User prompt.
+            max_tokens: Max tokens to generate.
+            top_k: Number of top alternatives to request (default: provider max).
+
+        Returns:
+            CompletionLogprobs with normalized token data.
+        """
+        return self.generate(prompt, max_tokens=max_tokens, top_k=top_k)
+
+    def score_output(
+        self,
+        prompt: str,
+        output: str,
+        *,
+        top_k: Optional[int] = None,
+    ) -> CompletionLogprobs:
+        """Score an output given its prompt context using echo/teacher-forcing.
+
+        Sends the full conversation (user prompt + assistant output) to the
+        API with echo=True, so logprobs are returned for the output tokens
+        conditioned on the prompt.
+
+        Args:
+            prompt: The user prompt that produced the output.
+            output: The output text to score.
+            top_k: Number of top alternatives per position.
+
+        Returns:
+            CompletionLogprobs for the output tokens.
+
+        Raises:
+            ProviderCapabilityError: If the provider lacks echo support.
+        """
+        if not self.spec.echo_supported:
+            raise ProviderCapabilityError(
+                f"Provider '{self.spec.name}' does not support echo-based output "
+                f"scoring.  Use a provider with echo_supported=True "
+                f"(e.g. together, vllm, fireworks).",
+                capability="echo",
+                provider=self.spec.name,
+            )
+        messages = [
+            {"role": "user", "content": prompt},
+            {"role": "assistant", "content": output},
+        ]
+        return self.generate(
+            prompt,
+            max_tokens=1,
+            top_k=top_k,
+            echo=True,
+            messages=messages,
+        )
+
     def score_generation(
         self,
         prompt: str,
@@ -563,7 +637,15 @@ class OpenAICompatibleProvider:
         )
 
     def check_health(self) -> dict[str, Any]:
-        """Quick health check: can we reach the API and get logprobs?"""
+        """Quick health check: can we reach the API and get logprobs?
+
+        Raises:
+            ValueError: If the API key is missing and the provider requires one.
+        """
+        if not self.api_key and self.spec.api_key_env:
+            raise ValueError(
+                f"API key not provided. Set {self.spec.api_key_env} or pass --api-key."
+            )
         try:
             result = self.generate("Say OK", max_tokens=2, top_k=1)
             return {
@@ -573,6 +655,8 @@ class OpenAICompatibleProvider:
                 "top_k_available": result.has_top_k(),
                 "token_count": len(result.tokens),
             }
+        except ValueError:
+            raise
         except Exception as e:
             return {
                 "healthy": False,

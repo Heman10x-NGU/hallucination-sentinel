@@ -176,13 +176,50 @@ class BaseProvider(ABC):
         ...
 
     @abstractmethod
+    def generate_with_logprobs(
+        self,
+        prompt: str,
+        *,
+        max_tokens: int = 100,
+        top_k: Optional[int] = None,
+    ) -> CompletionLogprobs:
+        """Generate text from prompt and return logprobs for generated tokens.
+
+        This is a focused variant of generate() without echo/teacher-forcing.
+        Use score_output() to score a specific output against a prompt.
+        """
+        ...
+
+    @abstractmethod
+    def score_output(
+        self,
+        prompt: str,
+        output: str,
+        *,
+        top_k: Optional[int] = None,
+    ) -> CompletionLogprobs:
+        """Score an output given its prompt context.
+
+        Uses echo/teacher-forcing: the provider receives the full
+        (prompt, output) pair and returns logprobs for the output tokens
+        conditioned on the prompt.
+
+        Raises:
+            ProviderCapabilityError: If the provider lacks echo support.
+        """
+        ...
+
+    @abstractmethod
     def score_text(
         self,
         text: str,
         *,
         top_k: Optional[int] = None,
     ) -> CompletionLogprobs:
-        """Score arbitrary text using echo-based prompt scoring."""
+        """Score arbitrary text using echo-based prompt scoring.
+
+        No prompt context is used -- the text is scored in isolation.
+        """
         ...
 
     @abstractmethod

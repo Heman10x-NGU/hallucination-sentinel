@@ -28,6 +28,7 @@ from .calibration import (
     save_calibration,
 )
 from .ces import compute_ces
+from .schemas import parse_label
 from .entropy import (
     entropy_from_logprobs,
     entropy_from_probs,
@@ -132,7 +133,7 @@ def calibrate(
         entropy_sequences.append(arr)
         if mode == "supervised":
             label = rec.get("label", True)
-            labels.append(bool(label))
+            labels.append(label)
 
     artifact = build_calibration(
         entropy_sequences,
@@ -192,19 +193,13 @@ def inspect_calibration(calibration: str):
 
 
 # ---------------------------------------------------------------------------
-# score
+# score / check (shared implementation)
 # ---------------------------------------------------------------------------
 
-@main.command()
-@click.option("--entropy-json", required=True, type=click.Path(exists=True),
-              help="Path to entropy sequence JSON file.")
-@click.option("--calibration", required=True, type=click.Path(exists=True),
-              help="Path to calibration artifact JSON.")
-def score(entropy_json: str, calibration: str):
+def _score_entropy_file(entropy_json: str, calibration: str) -> None:
     """Compute CES score from an entropy sequence file.
 
-    The entropy JSON must contain an 'entropy' field with a list of
-    per-token entropy values.
+    Shared implementation for both ``score`` and ``check`` commands.
     """
     data = json.loads(Path(entropy_json).read_text())
     entropy_vals = data.get("entropy")
@@ -231,39 +226,76 @@ def score(entropy_json: str, calibration: str):
     })
 
 
+@main.command()
+@click.option("--entropy-json", required=True, type=click.Path(exists=True),
+              help="Path to entropy sequence JSON file.")
+@click.option("--calibration", required=True, type=click.Path(exists=True),
+              help="Path to calibration artifact JSON.")
+def score(entropy_json: str, calibration: str):
+    """Compute CES score from an entropy sequence file.
+
+    The entropy JSON must contain an 'entropy' field with a list of
+    per-token entropy values.
+    """
+    _score_entropy_file(entropy_json, calibration)
+
+
+@main.command()
+@click.option("--entropy-json", required=True, type=click.Path(exists=True),
+              help="Path to entropy sequence JSON file.")
+@click.option("--calibration", required=True, type=click.Path(exists=True),
+              help="Path to calibration artifact JSON.")
+def check(entropy_json: str, calibration: str):
+    """Alias for ``score`` -- compute CES score from an entropy sequence file.
+
+    The entropy JSON must contain an 'entropy' field with a list of
+    per-token entropy values.
+    """
+    _score_entropy_file(entropy_json, calibration)
+
+
 # ---------------------------------------------------------------------------
 # score-provider
 # ---------------------------------------------------------------------------
 
 @main.command("score-provider")
-@click.option("--prompt", required=True, type=click.Path(exists=True),
+@click.option("--prompt", default=None, type=click.Path(exists=True),
               help="Path to prompt text file.")
-@click.option("--output", "output_path", required=True, type=click.Path(exists=True),
+@click.option("--output", "output_path", default=None, type=click.Path(exists=True),
               help="Path to output text file.")
 @click.option("--provider", required=True, help="Provider preset name.")
 @click.option("--model", required=True, help="Model name.")
 @click.option("--calibration", required=True, type=click.Path(exists=True),
               help="Path to calibration artifact JSON.")
+@click.option("--mode", "scoring_mode", default="score-output",
+              type=click.Choice(["generated", "score-output", "score-text"]),
+              help="Scoring mode: generated (generate+score), "
+                   "score-output (score output given prompt), "
+                   "score-text (score arbitrary text).")
 @click.option("--base-url", default=None, help="Override provider base URL.")
 @click.option("--api-key", default=None, help="Override API key.")
 def score_provider(
-    prompt: str,
-    output_path: str,
+    prompt: Optional[str],
+    output_path: Optional[str],
     provider: str,
     model: str,
     calibration: str,
+    scoring_mode: str,
     base_url: Optional[str],
     api_key: Optional[str],
 ):
-    """Score output text using a provider's logprobs.
+    """Score LLM outputs using a provider's logprobs.
 
-    Requires the provider to support echo-based text scoring.
-    Only available after the provider passes a smoke test.
+    Modes:
+        generated     -- Generate text from --prompt, then score the generation.
+                         Requires --prompt.  --output is ignored.
+        score-output  -- Score an existing output conditioned on its prompt.
+                         Requires both --prompt and --output.
+                         Provider must support echo/teacher-forcing.
+        score-text    -- Score arbitrary text in isolation (no prompt context).
+                         Requires --output.
     """
     from .providers.openai_compatible import OpenAICompatibleProvider, PROVIDER_SPECS
-
-    prompt_text = Path(prompt).read_text().strip()
-    output_text = Path(output_path).read_text().strip()
 
     # Validate provider exists
     if provider not in PROVIDER_SPECS:
@@ -272,12 +304,28 @@ def score_provider(
             f"Available: {', '.join(PROVIDER_SPECS)}"
         )
 
-    spec = PROVIDER_SPECS[provider]
-    if not spec.echo_supported:
+    # Validate mode-specific required options
+    if scoring_mode in ("generated", "score-output") and not prompt:
         raise click.ClickException(
-            f"Provider '{provider}' does not support echo-based text scoring.  "
-            "Use a provider with echo_supported=True (e.g. together, vllm, fireworks)."
+            f"--mode {scoring_mode} requires --prompt."
         )
+    if scoring_mode in ("score-output", "score-text") and not output_path:
+        raise click.ClickException(
+            f"--mode {scoring_mode} requires --output."
+        )
+
+    # For score-output mode, verify provider supports echo before reading files
+    if scoring_mode == "score-output":
+        spec = PROVIDER_SPECS[provider]
+        if not spec.echo_supported:
+            raise click.ClickException(
+                f"Provider '{provider}' does not support echo-based output scoring.  "
+                "Use a provider with echo_supported=True (e.g. together, vllm, fireworks)."
+            )
+
+    # Read input files
+    prompt_text = Path(prompt).read_text().strip() if prompt else ""
+    output_text = Path(output_path).read_text().strip() if output_path else ""
 
     prov = OpenAICompatibleProvider.from_preset(
         provider,
@@ -286,8 +334,15 @@ def score_provider(
         base_url=base_url,
     )
 
-    # Score the output text
-    completion = prov.score_text(output_text)
+    # Dispatch to the correct provider method based on mode
+    if scoring_mode == "generated":
+        completion = prov.generate_with_logprobs(prompt_text)
+    elif scoring_mode == "score-output":
+        completion = prov.score_output(prompt_text, output_text)
+    elif scoring_mode == "score-text":
+        completion = prov.score_text(output_text)
+    else:
+        raise click.ClickException(f"Unknown scoring mode: {scoring_mode}")
 
     # Compute entropy from top-k logprobs
     from .entropy import entropy_from_topk_logprobs
@@ -303,6 +358,7 @@ def score_provider(
     ces_result = compute_ces(entropy_result.entropies, artifact)
 
     _json_output({
+        "scoring_mode": scoring_mode,
         "ces_score": round(ces_result.ces_score, 6),
         "risk_level": ces_result.risk_level,
         "cdf_mean": round(ces_result.cdf_mean, 6),
@@ -323,141 +379,111 @@ def score_provider(
 @main.command()
 @click.option("--input", "input_path", required=True, type=click.Path(exists=True),
               help="Path to eval JSONL file.")
-@click.option("--calibration", required=True, type=click.Path(exists=True),
-              help="Path to calibration artifact JSON.")
+@click.option("--calibration", "calibration_path", default=None,
+              type=click.Path(exists=True),
+              help="Path to calibration artifact JSON. Required for raw entropy rows.")
 @click.option("--output", "output_path", default="eval_report.json",
-              type=click.Path(), help="Output path for eval report JSON.")
+              type=click.Path(), help="Output path for eval report.")
+@click.option("--markdown", "markdown_output", is_flag=True, default=False,
+              help="Output report as Markdown instead of JSON.")
+@click.option("--threshold", "thresholds", multiple=True, type=float,
+              help="Decision thresholds for confusion matrices (repeatable). "
+                   "Defaults to [0.5, 0.7, 0.8, 0.9].")
+@click.option("--bootstrap/--no-bootstrap", default=True,
+              help="Compute bootstrap confidence intervals (default: on).")
+@click.option("--n-bootstrap", default=1000, type=int,
+              help="Number of bootstrap resamples (default: 1000).")
 def eval_cmd(
     input_path: str,
-    calibration: str,
+    calibration_path: Optional[str],
     output_path: str,
+    markdown_output: bool,
+    thresholds: tuple[float, ...],
+    bootstrap: bool,
+    n_bootstrap: int,
 ):
-    """Evaluate CES against baseline metrics.
+    """Evaluate CES against baseline metrics on labeled data.
 
-    Input JSONL lines must have:
-      - entropy: list of per-token entropy values
-      - label: boolean (true = faithful, false = hallucinated)
-      - ln_entropy (optional): length-normalized entropy baseline
-      - perplexity (optional): perplexity baseline
-      - length (optional): generation length baseline
+    Input JSONL lines can be in two formats:
 
-    Computes AUROC, AUPRC, confusion matrix at thresholds for CES
-    and all provided baselines.
+    \b
+    Pre-scored (no calibration needed):
+      {"ces_score": 0.8, "label": 1, "token_count": 10,
+       "token_entropies": [1.2, 0.8, ...]}
+
+    \b
+    Raw entropy (requires --calibration):
+      {"entropy": [1.2, 0.8, 0.5, ...], "label": 1}
+
+    The report includes AUROC/AUPRC with bootstrap confidence intervals,
+    confusion matrices at configured thresholds, baseline comparisons,
+    per-length-bucket calibration coverage, and lag-1 autocorrelation
+    diagnostics.
     """
-    try:
-        from sklearn.metrics import (
-            roc_auc_score,
-            average_precision_score,
-            confusion_matrix,
-        )
-    except ImportError:
+    from .eval import (
+        build_eval_report,
+        normalize_to_eval_record,
+        report_to_json,
+        report_to_markdown,
+        save_report_json,
+        save_report_markdown,
+    )
+
+    records_raw = _read_jsonl(input_path)
+
+    # Load calibration only if needed
+    calibration = None
+    if calibration_path:
+        calibration = load_calibration(calibration_path)
+
+    # Detect input format: if any row has 'entropy' but no 'ces_score',
+    # calibration is required.
+    has_raw = any("entropy" in r and "ces_score" not in r for r in records_raw)
+    if has_raw and calibration is None:
         raise click.ClickException(
-            "scikit-learn is required for eval.  "
-            "Install with: pip install hallucination-sentinel[eval]"
+            "Input contains raw entropy rows but --calibration was not provided.  "
+            "Provide --calibration to compute CES scores from entropy sequences."
         )
 
-    records = _read_jsonl(input_path)
-    artifact = load_calibration(calibration)
-
-    # Compute CES for each record
-    ces_scores: list[float] = []
-    labels: list[bool] = []
-    ln_entropies: list[Optional[float]] = []
-    perplexities: list[Optional[float]] = []
-    lengths: list[Optional[int]] = []
-
-    for idx, rec in enumerate(records):
-        entropy_vals = rec.get("entropy")
-        if entropy_vals is None:
-            raise click.ClickException(
-                f"Record {idx + 1} missing 'entropy' field."
-            )
-        entropy_arr = np.asarray(entropy_vals, dtype=np.float64)
-        if entropy_arr.size == 0:
-            raise click.ClickException(
-                f"Record {idx + 1} has empty 'entropy' array."
-            )
-
-        ces_result = compute_ces(entropy_arr, artifact)
-        ces_scores.append(ces_result.ces_score)
-
-        label = rec.get("label")
-        if label is None:
-            raise click.ClickException(
-                f"Record {idx + 1} missing 'label' field."
-            )
-        labels.append(bool(label))
-
-        ln_entropies.append(rec.get("ln_entropy"))
-        perplexities.append(rec.get("perplexity"))
-        lengths.append(rec.get("length"))
-
-    y_true = np.array(labels, dtype=int)
-    y_ces = np.array(ces_scores)
-
-    # Compute metrics for CES
-    report: dict = {"n_samples": len(records), "methods": {}}
-
-    def _compute_method_metrics(name: str, scores: np.ndarray) -> dict:
-        """Compute AUROC, AUPRC, confusion matrix for a method."""
+    # Normalize all rows to EvalRecord
+    eval_records = []
+    for idx, rec in enumerate(records_raw):
         try:
-            auroc = float(roc_auc_score(y_true, scores))
-        except ValueError:
-            auroc = None
-        try:
-            auprc = float(average_precision_score(y_true, scores))
-        except ValueError:
-            auprc = None
+            er = normalize_to_eval_record(rec, lineno=idx + 1, calibration=calibration)
+        except ValueError as exc:
+            raise click.ClickException(str(exc))
+        eval_records.append(er)
 
-        # Confusion matrix at default threshold (median of scores)
-        threshold = float(np.median(scores))
-        y_pred = (scores >= threshold).astype(int)
-        cm = confusion_matrix(y_true, y_pred)
-        tn, fp, fn, tp = cm.ravel()
+    if not eval_records:
+        raise click.ClickException("No evaluation records loaded.")
 
-        return {
-            "auroc": round(auroc, 6) if auroc is not None else None,
-            "auprc": round(auprc, 6) if auprc is not None else None,
-            "threshold": round(threshold, 6),
-            "confusion_matrix": {
-                "tp": int(tp),
-                "fp": int(fp),
-                "tn": int(tn),
-                "fn": int(fn),
-            },
-        }
+    # Build report via eval.py
+    threshold_list = list(thresholds) if thresholds else None
+    report = build_eval_report(
+        eval_records,
+        thresholds=threshold_list,
+        bootstrap=bootstrap,
+        n_bootstrap=n_bootstrap,
+    )
 
-    # CES metrics
-    report["methods"]["ces"] = _compute_method_metrics("ces", y_ces)
-
-    # LN-Entropy baseline
-    ln_vals = [v for v in ln_entropies if v is not None]
-    if len(ln_vals) == len(records):
-        ln_arr = np.array(ln_vals)
-        report["methods"]["ln_entropy"] = _compute_method_metrics("ln_entropy", ln_arr)
-
-    # Perplexity baseline
-    perp_vals = [v for v in perplexities if v is not None]
-    if len(perp_vals) == len(records):
-        perp_arr = np.array(perp_vals)
-        report["methods"]["perplexity"] = _compute_method_metrics("perplexity", perp_arr)
-
-    # Length baseline
-    len_vals = [v for v in lengths if v is not None]
-    if len(len_vals) == len(records):
-        len_arr = np.array(len_vals, dtype=float)
-        report["methods"]["generation_length"] = _compute_method_metrics(
-            "generation_length", len_arr
-        )
-
-    _write_json(output_path, report)
-
-    _json_output({
-        "status": "ok",
-        "output": str(output_path),
-        "n_samples": report["n_samples"],
-        "methods_evaluated": list(report["methods"].keys()),
-    })
+    # Serialize and save
+    ext = Path(output_path).suffix.lower()
+    if markdown_output or ext in (".md", ".markdown"):
+        save_report_markdown(report, output_path)
+        _json_output({
+            "status": "ok",
+            "format": "markdown",
+            "output": str(output_path),
+            "n_samples": report.n_samples,
+        })
+    else:
+        save_report_json(report, output_path)
+        _json_output({
+            "status": "ok",
+            "format": "json",
+            "output": str(output_path),
+            "n_samples": report.n_samples,
+        })
 
 
 # ---------------------------------------------------------------------------
@@ -465,40 +491,74 @@ def eval_cmd(
 # ---------------------------------------------------------------------------
 
 @main.command("smoke-provider")
-@click.option("--provider", required=True, help="Provider preset name.")
+@click.option("--provider", required=True, help="Provider preset name (or 'custom').")
 @click.option("--base-url", default=None, help="Override provider base URL.")
 @click.option("--model", default=None, help="Override model name.")
-def smoke_provider(provider: str, base_url: Optional[str], model: Optional[str]):
+@click.option("--api-key", default=None, help="Override API key.")
+@click.option("--max-top-k", default=None, type=int, help="Override max top-k (custom provider only).")
+def smoke_provider(
+    provider: str,
+    base_url: Optional[str],
+    model: Optional[str],
+    api_key: Optional[str],
+    max_top_k: Optional[int],
+):
     """Test a provider's logprob support.
 
     Makes a minimal API call to verify the provider can return logprobs.
     Reports capabilities: selected-token logprobs, top-k, echo support.
+
+    Use --provider custom with --base-url, --model, --api-key, --max-top-k
+    for arbitrary OpenAI-compatible endpoints.
     """
     from .providers.openai_compatible import OpenAICompatibleProvider, PROVIDER_SPECS
 
-    if provider not in PROVIDER_SPECS:
-        raise click.ClickException(
-            f"Unknown provider '{provider}'.  "
-            f"Available: {', '.join(PROVIDER_SPECS)}"
+    if provider == "custom":
+        if not base_url or not model:
+            raise click.ClickException(
+                "--provider custom requires --base-url and --model."
+            )
+        prov = OpenAICompatibleProvider.custom(
+            base_url=base_url,
+            model=model,
+            api_key=api_key or "",
+            max_top_k=max_top_k or 20,
         )
-
-    spec = PROVIDER_SPECS[provider]
+        spec = prov.spec
+    else:
+        if provider not in PROVIDER_SPECS:
+            raise click.ClickException(
+                f"Unknown provider '{provider}'.  "
+                f"Available: {', '.join(PROVIDER_SPECS)}, custom"
+            )
+        spec = PROVIDER_SPECS[provider]
+        try:
+            prov = OpenAICompatibleProvider.from_preset(
+                provider,
+                api_key=api_key,
+                model=model,
+                base_url=base_url,
+            )
+        except Exception as e:
+            _json_output({
+                "provider": provider,
+                "status": "FAIL",
+                "error": str(e),
+            })
+            return
 
     try:
-        prov = OpenAICompatibleProvider.from_preset(
-            provider,
-            model=model,
-            base_url=base_url,
-        )
-    except Exception as e:
+        health = prov.check_health()
+    except ValueError as e:
         _json_output({
-            "provider": provider,
+            "provider": spec.name,
+            "preset": provider,
+            "base_url": base_url or spec.base_url,
+            "model": model or spec.model,
             "status": "FAIL",
             "error": str(e),
         })
         return
-
-    health = prov.check_health()
 
     result = {
         "provider": spec.name,

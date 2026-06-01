@@ -4,12 +4,19 @@ Middleware for wrapping LLM calls with hallucination checks.
 Provides:
 - ``guard_output`` -- the primary gate function that scores a prompt/output
   pair against a calibration artifact and returns a ``RoutingDecision``.
+  Requires real token entropy/logprobs from a provider.
+- ``guard_output_from_entropies`` -- offline/batch path with pre-computed
+  entropy sequences.
+- ``guard_output_with_logprobs`` -- provider path with pre-fetched logprobs.
+- ``guard_output_with_text_heuristic_experimental`` -- experimental text-only
+  heuristic (NOT recommended for production use).
 - ``SentinelMiddleware`` -- a callable wrapper that intercepts LLM outputs,
   runs the sentinel pipeline, and optionally blocks or annotates results.
 """
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Optional
@@ -19,7 +26,7 @@ import numpy as np
 from ..calibration import CalibrationArtifact
 from ..ces import compute_ces
 from ..entropy import entropy_from_topk_logprobs
-from ..providers.base import CompletionLogprobs, TokenLogprobResult
+from ..providers.base import CompletionLogprobs, ProviderCapabilityError, TokenLogprobResult
 from ..schemas import SentinelResult
 from ..thresholds import RiskLevel
 
@@ -262,12 +269,19 @@ def guard_output(
     you already have both the prompt and the model output (e.g. from a
     RAG pipeline, an agent tool call, or a batch QA run).
 
+    **Important**: This function requires real token entropy/logprobs from
+    a provider. It will raise :class:`ProviderCapabilityError` if called
+    without a provider that supports logprob extraction. For offline/batch
+    scoring with pre-computed entropies, use :func:`guard_output_from_entropies`.
+    For experimental text-only heuristic scoring, use
+    :func:`guard_output_with_text_heuristic_experimental`.
+
     Args:
         prompt: The prompt that produced *output*.
         output: The model-generated text to evaluate.
         calibration: A :class:`CalibrationArtifact` (loaded or freshly built).
         provider: Name of the LLM provider that generated *output*.
-            Used for metadata; does not affect scoring.
+            Must be a real provider that supports logprob extraction.
         policy: How critical the downstream task is.  A ``MEDIUM`` policy
             with ``HIGH`` risk yields ``REQUIRE_EVIDENCE``; the same risk
             with ``CRITICAL`` policy yields ``HUMAN_REVIEW``.
@@ -278,50 +292,25 @@ def guard_output(
 
     Raises:
         ValueError: If *output* is empty or *calibration* has no ECDF values.
+        ProviderCapabilityError: If provider does not support logprob extraction.
     """
     if not output or not output.strip():
         raise ValueError("output must be a non-empty string")
 
-    # -- Compute entropy sequence from output text --------------------------
-    # We use the provider's score_text capability when available, but the
-    # middleware is designed to work with pre-computed entropy sequences
-    # stored in the output metadata.  For the common case where we only
-    # have the raw text, we fall back to a simple heuristic: compute
-    # per-token entropy from the calibration artifact's reference
-    # distribution as a proxy, or require a provider to score the text.
-
-    # Strategy: try provider-based scoring first, fall back to a
-    # lightweight approximation if the provider is not configured.
-    entropies = _score_text_entropies(output, provider)
-
-    # -- Compute CES --------------------------------------------------------
-    ces_result = compute_ces(entropies, calibration)
-
-    risk_level = RiskLevel(ces_result.risk_level.lower())
-
-    # -- Detect diagnostic peaks --------------------------------------------
-    peaks = _detect_peaks(entropies)
-
-    # -- Resolve routing action ---------------------------------------------
-    action = _resolve_action(risk_level, policy)
-
-    # -- Merge warnings -----------------------------------------------------
-    all_warnings: list[str] = list(ces_result.warnings)
-
-    # Add provider context
-    if provider and provider != "unknown":
-        all_warnings.append(f"provider={provider}")
-
-    # -- Build calibration metadata -----------------------------------------
-    cal_meta = _calibration_metadata(calibration)
-
-    return RoutingDecision(
-        action=action,
-        risk_level=risk_level,
-        ces_score=ces_result.ces_score,
-        warnings=tuple(all_warnings),
-        diagnostic_peaks=tuple(peaks),
-        calibration_metadata=cal_meta,
+    # guard_output requires real logprobs from a provider. Text-only heuristic
+    # is no longer used in production flow. Use guard_output_from_entropies()
+    # for offline/batch scoring, or guard_output_with_logprobs() when you
+    # already have logprob data from a provider call.
+    raise ProviderCapabilityError(
+        "guard_output() requires real token entropy/logprobs from a provider. "
+        "Text-only heuristic scoring is not supported in the production flow. "
+        "Use guard_output_from_entropies() for offline/batch scoring with "
+        "pre-computed entropy sequences, or guard_output_with_logprobs() "
+        "when you already have logprob data from a provider call. "
+        "For experimental text-only heuristic, use "
+        "guard_output_with_text_heuristic_experimental().",
+        capability="logprobs",
+        provider=provider,
     )
 
 
@@ -439,25 +428,24 @@ def guard_output_from_entropies(
 
 
 # ---------------------------------------------------------------------------
-# Text-only entropy scoring (lightweight fallback)
+# Text-only entropy scoring (EXPERIMENTAL - NOT for production use)
 # ---------------------------------------------------------------------------
 
 
 def _score_text_entropies(
     text: str,
-    provider: str,
 ) -> np.ndarray:
-    """Produce per-token entropy values for *text*.
+    """Produce per-token entropy values for *text* using a character-level heuristic.
 
-    When a provider is available and supports echo-based scoring, this
-    calls ``score_text`` and computes entropy from top-k logprobs.
-    Otherwise it falls back to a simple character-level heuristic so
-    that ``guard_output`` can still return a meaningful (if coarse)
-    routing decision.
+    .. warning::
+        This is an **experimental** heuristic that estimates entropy from
+        token length, digit presence, and capitalization patterns. It does
+        NOT produce meaningful uncertainty estimates and should NOT be used
+        in production. For real CES scoring, use providers with logprob support.
 
     The heuristic assigns higher entropy to tokens that are rare or
     unusual-looking (long, mixed-case, containing digits).  This is a
-    *very* rough proxy; for production use, always pass a real provider.
+    *very* rough proxy and is NOT a substitute for real token entropy.
     """
     # Tokenise naively by whitespace
     tokens = text.split()
@@ -475,6 +463,79 @@ def _score_text_entropies(
         entropies[i] = length_factor * (0.5 + diversity)
 
     return entropies
+
+
+def guard_output_with_text_heuristic_experimental(
+    prompt: str,
+    output: str,
+    *,
+    calibration: CalibrationArtifact,
+    provider: str = "unknown",
+    policy: TaskCriticality = TaskCriticality.MEDIUM,
+) -> RoutingDecision:
+    """Score *output* using an experimental text-only heuristic.
+
+    .. danger::
+        This function uses a **character-level heuristic** that estimates
+        entropy from token length, digits, and capitalization. It does NOT
+        produce meaningful uncertainty estimates and should NOT be used in
+        production. This exists only for offline experimentation and testing.
+
+        For production use, use:
+        - :func:`guard_output_from_entropies` with real entropy sequences
+        - :func:`guard_output_with_logprobs` with provider logprob data
+
+    The heuristic assigns higher entropy to tokens that are rare or
+    unusual-looking (long, mixed-case, containing digits). This is a
+    *very* rough proxy; CES scores from this function are NOT comparable
+    to scores from real entropy data.
+
+    Args:
+        prompt: The prompt that produced *output*.
+        output: The model-generated text to evaluate.
+        calibration: A :class:`CalibrationArtifact` (loaded or freshly built).
+        provider: Name of the LLM provider (for metadata only).
+        policy: How critical the downstream task is.
+
+    Returns:
+        A :class:`RoutingDecision` (but scores are unreliable).
+
+    Raises:
+        ValueError: If *output* is empty or *calibration* has no ECDF values.
+    """
+    warnings.warn(
+        "guard_output_with_text_heuristic_experimental() uses a character-level "
+        "heuristic that does NOT produce meaningful uncertainty estimates. "
+        "CES scores from this function are NOT comparable to scores from real "
+        "entropy data. Use guard_output_from_entropies() or "
+        "guard_output_with_logprobs() for production scoring.",
+        UserWarning,
+        stacklevel=2,
+    )
+
+    if not output or not output.strip():
+        raise ValueError("output must be a non-empty string")
+
+    entropies = _score_text_entropies(output)
+
+    ces_result = compute_ces(entropies, calibration)
+    risk_level = RiskLevel(ces_result.risk_level.lower())
+    peaks = _detect_peaks(entropies)
+    action = _resolve_action(risk_level, policy)
+
+    all_warnings: list[str] = list(ces_result.warnings)
+    all_warnings.append("EXPERIMENTAL: text-only heuristic (not real entropy)")
+    if provider and provider != "unknown":
+        all_warnings.append(f"provider={provider}")
+
+    return RoutingDecision(
+        action=action,
+        risk_level=risk_level,
+        ces_score=ces_result.ces_score,
+        warnings=tuple(all_warnings),
+        diagnostic_peaks=tuple(peaks),
+        calibration_metadata=_calibration_metadata(calibration),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -506,9 +567,15 @@ class SentinelMiddleware:
         )
         result = middleware("What is the capital of France?")
 
-    The wrapper calls the LLM, scores the output via ``guard_output``, and
-    either returns the text unchanged, annotates it with warnings, or raises
+    The wrapper calls the LLM, scores the output, and either returns the
+    text unchanged, annotates it with warnings, or raises
     :class:`HallucinationBlockedError` depending on the routing decision.
+
+    .. note::
+        This middleware uses the experimental text-only heuristic for scoring.
+        For production use with real entropy/logprobs, use
+        :func:`guard_output_from_entropies` or :func:`guard_output_with_logprobs`
+        directly.
     """
 
     llm_call: Callable[..., str]
@@ -518,11 +585,16 @@ class SentinelMiddleware:
     on_decision: Optional[Callable[[RoutingDecision], None]] = None
 
     def __call__(self, prompt: str, **kwargs: Any) -> str:
-        """Call the LLM and gate the result.
+        """Call LLM and gate the result using experimental text-only heuristic.
 
         Returns the LLM response text unchanged (even when warnings are
         emitted).  Raises :class:`HallucinationBlockedError` when the
         routing action is ``BLOCK``.
+
+        .. warning::
+            Uses experimental text-only heuristic. For production, use
+            :func:`guard_output_from_entropies` or
+            :func:`guard_output_with_logprobs` directly.
 
         Args:
             prompt: The prompt to send to the LLM.
@@ -536,7 +608,7 @@ class SentinelMiddleware:
         """
         response = self.llm_call(prompt, **kwargs)
 
-        decision = guard_output(
+        decision = guard_output_with_text_heuristic_experimental(
             prompt,
             response,
             calibration=self.calibration,

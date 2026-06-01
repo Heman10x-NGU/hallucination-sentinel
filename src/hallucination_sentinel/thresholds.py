@@ -4,7 +4,7 @@ Threshold policies for classifying CES scores into risk bands.
 Two policies are supported:
 
 1. **REFERENCE_QUANTILE** (default, works with or without labels):
-   Uses quantiles of the reference ECDF to define boundaries.
+   Uses quantiles of reference CES scores to define boundaries.
 
 2. **MAX_TPR_AT_FPR** (supervised only):
    Finds the threshold that maximises true-positive rate subject to a
@@ -13,6 +13,7 @@ Two policies are supported:
 
 from __future__ import annotations
 
+import warnings
 from enum import Enum
 from typing import Optional
 
@@ -48,22 +49,24 @@ class RiskLevel(str, Enum):
 # ---------------------------------------------------------------------------
 
 def _quantile_thresholds(
-    ecdf_values: list[float],
+    reference_ces_scores: list[float],
     low_q: float = 75.0,
     medium_q: float = 90.0,
     high_q: float = 97.0,
 ) -> dict[str, float]:
-    """Compute quantile boundaries from the reference ECDF values.
+    """Compute quantile boundaries from reference CES scores.
 
     Default bands:
         LOW     : CES < p75
         MEDIUM  : p75 <= CES < p90
         HIGH    : p90 <= CES < p97
         CRITICAL: CES >= p97
+
+    Falls back to static defaults if reference_ces_scores is empty.
     """
-    if not ecdf_values:
+    if not reference_ces_scores:
         return {"low": 0.75, "medium": 0.90, "high": 0.97}
-    arr = np.asarray(ecdf_values, dtype=np.float64)
+    arr = np.asarray(reference_ces_scores, dtype=np.float64)
     return {
         "low": float(np.percentile(arr, low_q)),
         "medium": float(np.percentile(arr, medium_q)),
@@ -140,8 +143,8 @@ def assign_thresholds(
 
     Args:
         calibration_artifact: A :class:`CalibrationArtifact` whose
-            ``ecdf_values`` (and optionally ``thresholds``) will be updated
-            **in place**.
+            ``reference_ces_scores`` (and optionally ``thresholds``) will be
+            updated **in place**.
         policy: ``"reference_quantile"`` (default) or ``"max_tpr_at_fpr"``.
         low_q, medium_q, high_q: Percentile positions for the quantile
             policy (0-100 scale).
@@ -160,8 +163,18 @@ def assign_thresholds(
     policy = ThresholdPolicy(policy)
 
     if policy is ThresholdPolicy.REFERENCE_QUANTILE:
+        reference_ces_scores = getattr(calibration_artifact, "reference_ces_scores", None)
+        if not reference_ces_scores:
+            warnings.warn(
+                "CalibrationArtifact lacks reference_ces_scores (likely an "
+                "older artifact). Using static fallback thresholds "
+                "{low: 0.75, medium: 0.90, high: 0.97}. Recalibrate to "
+                "get data-driven thresholds.",
+                UserWarning,
+                stacklevel=2,
+            )
         thresholds = _quantile_thresholds(
-            calibration_artifact.ecdf_values, low_q, medium_q, high_q
+            reference_ces_scores or [], low_q, medium_q, high_q
         )
     elif policy is ThresholdPolicy.MAX_TPR_AT_FPR:
         if ces_scores_faithful is None or ces_scores_hallucinated is None:

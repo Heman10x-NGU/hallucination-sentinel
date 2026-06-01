@@ -5,12 +5,16 @@ Covers:
 - Supervised threshold policy (Youden's J / max-TPR-at-FPR)
 - RiskLevel enum
 - Edge cases
+- Threshold bug fix: thresholds must be in CES [0,1] space
 """
+
+import warnings
 
 import numpy as np
 import pytest
 
 from hallucination_sentinel.calibration import CalibrationArtifact, build_calibration
+from hallucination_sentinel.ces import compute_ces
 from hallucination_sentinel.thresholds import (
     RiskLevel,
     ThresholdPolicy,
@@ -190,3 +194,60 @@ class TestThresholdPolicyEnum:
         art = _make_artifact()
         with pytest.raises(ValueError):
             assign_thresholds(art, "nonexistent_policy")
+
+
+# ---------------------------------------------------------------------------
+# Threshold bug fix: thresholds must be in CES [0,1] space
+# ---------------------------------------------------------------------------
+
+class TestThresholdBugFix:
+    """Verify that thresholds are in CES [0,1] space, not raw entropy space."""
+
+    def test_reference_quantile_thresholds_are_in_ces_space(self):
+        """Thresholds from REFERENCE_QUANTILE policy must be in [0, 1]."""
+        art = build_calibration(
+            [np.linspace(1.0, 3.0, 50) for _ in range(20)]
+        )
+        thresholds = assign_thresholds(art)
+        assert 0.0 <= thresholds["low"] <= 1.0
+        assert 0.0 <= thresholds["medium"] <= 1.0
+        assert 0.0 <= thresholds["high"] <= 1.0
+
+    def test_extreme_ces_is_not_low_when_entropy_units_exceed_one(self):
+        """CES=1.0 must be CRITICAL, not LOW, even when entropy values > 1."""
+        art = build_calibration(
+            [np.linspace(1.0, 3.0, 50) for _ in range(20)]
+        )
+        assign_thresholds(art)
+        result = compute_ces(np.array([10.0] * 50), art)
+        assert result.ces_score == 1.0
+        assert result.risk_level == "CRITICAL"
+
+    def test_old_artifact_without_reference_ces_scores_uses_fallback(self):
+        """Old artifacts lacking reference_ces_scores get static fallback."""
+        art = CalibrationArtifact(
+            ecdf_values=[1.0, 2.0, 3.0],
+            reference_ces_scores=[],
+        )
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            thresholds = assign_thresholds(art)
+            assert len(w) == 1
+            assert "reference_ces_scores" in str(w[0].message)
+        assert thresholds == {"low": 0.75, "medium": 0.90, "high": 0.97}
+
+    def test_reference_ces_scores_populated_after_build(self):
+        """build_calibration must populate reference_ces_scores."""
+        art = build_calibration(
+            [np.linspace(1.0, 3.0, 50) for _ in range(20)]
+        )
+        assert len(art.reference_ces_scores) == 20
+        assert art.reference_ces_scores == sorted(art.reference_ces_scores)
+
+    def test_thresholds_ordering(self):
+        """Thresholds must be strictly ordered: low < medium < high."""
+        rng = np.random.RandomState(42)
+        seqs = [rng.uniform(0.5, 3.0, size=50) for _ in range(20)]
+        art = build_calibration(seqs)
+        thresholds = assign_thresholds(art)
+        assert thresholds["low"] < thresholds["medium"] < thresholds["high"]

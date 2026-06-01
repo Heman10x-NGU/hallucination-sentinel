@@ -504,6 +504,84 @@ class TestScoreText:
 
 
 # ---------------------------------------------------------------------------
+# OpenAICompatibleProvider.generate_with_logprobs
+# ---------------------------------------------------------------------------
+
+
+class TestGenerateWithLogprobs:
+    """Tests for generate_with_logprobs."""
+
+    @patch("hallucination_sentinel.providers.openai_compatible._call_chat_completions")
+    def test_delegates_to_generate(self, mock_call):
+        mock_call.return_value = _response_with_topk()
+        prov = OpenAICompatibleProvider.from_preset("openai", api_key="sk-test")
+        result = prov.generate_with_logprobs("Say hello", max_tokens=50, top_k=5)
+        assert len(result.tokens) == 2
+        assert result.has_top_k()
+        call_kwargs = mock_call.call_args[1]
+        assert call_kwargs["max_tokens"] == 50
+        assert call_kwargs["top_logprobs"] == 5
+
+    @patch("hallucination_sentinel.providers.openai_compatible._call_chat_completions")
+    def test_no_echo_sent(self, mock_call):
+        """generate_with_logprobs must not send echo=True."""
+        mock_call.return_value = _response_with_topk()
+        prov = OpenAICompatibleProvider.from_preset("together", api_key="tk")
+        prov.generate_with_logprobs("Say hello")
+        call_kwargs = mock_call.call_args[1]
+        assert call_kwargs.get("echo") is not True
+
+
+# ---------------------------------------------------------------------------
+# OpenAICompatibleProvider.score_output
+# ---------------------------------------------------------------------------
+
+
+class TestScoreOutput:
+    """Tests for score_output (prompt + output echo scoring)."""
+
+    @patch("hallucination_sentinel.providers.openai_compatible._call_chat_completions")
+    def test_sends_prompt_and_output_as_messages(self, mock_call):
+        mock_call.return_value = _response_with_topk()
+        prov = OpenAICompatibleProvider.from_preset("together", api_key="tk")
+        prov.score_output("What is 2+2?", "4")
+        call_kwargs = mock_call.call_args[1]
+        messages = call_kwargs["messages"]
+        assert len(messages) == 2
+        assert messages[0]["role"] == "user"
+        assert messages[0]["content"] == "What is 2+2?"
+        assert messages[1]["role"] == "assistant"
+        assert messages[1]["content"] == "4"
+        assert call_kwargs.get("echo") is True
+        assert call_kwargs.get("max_tokens") == 1
+
+    @patch("hallucination_sentinel.providers.openai_compatible._call_chat_completions")
+    def test_returns_completion_logprobs(self, mock_call):
+        mock_call.return_value = _response_with_topk()
+        prov = OpenAICompatibleProvider.from_preset("together", api_key="tk")
+        result = prov.score_output("What is 2+2?", "4")
+        assert isinstance(result, CompletionLogprobs)
+        assert len(result.tokens) > 0
+
+    def test_raises_capability_error_for_openai(self):
+        """score_output must raise ProviderCapabilityError for providers without echo."""
+        prov = OpenAICompatibleProvider.from_preset("openai", api_key="sk-test")
+        with pytest.raises(ProviderCapabilityError) as exc_info:
+            prov.score_output("What is 2+2?", "4")
+        assert "echo" in str(exc_info.value).lower()
+        assert exc_info.value.capability == "echo"
+        assert exc_info.value.provider == "OpenAI"
+
+    @patch("hallucination_sentinel.providers.openai_compatible._call_chat_completions")
+    def test_top_k_passed_through(self, mock_call):
+        mock_call.return_value = _response_with_topk()
+        prov = OpenAICompatibleProvider.from_preset("together", api_key="tk")
+        prov.score_output("prompt", "output", top_k=3)
+        call_kwargs = mock_call.call_args[1]
+        assert call_kwargs["top_logprobs"] == 3
+
+
+# ---------------------------------------------------------------------------
 # smoke_provider
 # ---------------------------------------------------------------------------
 
@@ -574,6 +652,12 @@ class TestProviderSpecs:
     def test_openai_spec_exists(self):
         assert "openai" in PROVIDER_SPECS
 
+    def test_mimo_provider_preset_exists(self):
+        assert "mimo" in PROVIDER_SPECS
+        spec = PROVIDER_SPECS["mimo"]
+        assert spec.name == "MIMO"
+        assert spec.api_key_env == "MIMO_API_KEY"
+
     def test_all_specs_have_required_fields(self):
         for name, spec in PROVIDER_SPECS.items():
             assert spec.name, f"{name} missing name"
@@ -586,6 +670,84 @@ class TestProviderSpecs:
         spec = PROVIDER_SPECS["openai"]
         with pytest.raises(AttributeError):
             spec.name = "changed"  # type: ignore[misc]
+
+
+class TestMimoProvider:
+    """Tests for the MIMO provider preset."""
+
+    def test_missing_mimo_key_has_clear_error(self, monkeypatch):
+        monkeypatch.delenv("MIMO_API_KEY", raising=False)
+        prov = OpenAICompatibleProvider.from_preset("mimo")
+        assert prov.api_key == ""
+        with pytest.raises(ValueError, match="MIMO_API_KEY"):
+            prov.check_health()
+
+    def test_mimo_from_preset_with_explicit_key(self):
+        prov = OpenAICompatibleProvider.from_preset("mimo", api_key="mk-test")
+        assert prov.spec.name == "MIMO"
+        assert prov.api_key == "mk-test"
+        assert prov.spec.api_key_env == "MIMO_API_KEY"
+
+    def test_mimo_model_override(self):
+        prov = OpenAICompatibleProvider.from_preset(
+            "mimo", api_key="k", model="custom-model"
+        )
+        assert prov.spec.model == "custom-model"
+
+    def test_mimo_base_url_override(self):
+        prov = OpenAICompatibleProvider.from_preset(
+            "mimo", api_key="k", base_url="https://mimo.example.com/v1"
+        )
+        assert prov.spec.base_url == "https://mimo.example.com/v1"
+
+
+class TestEmptyApiKeyHandling:
+    """Tests that empty API keys don't produce illegal Bearer headers."""
+
+    @patch("hallucination_sentinel.providers.openai_compatible.httpx")
+    def test_empty_api_key_does_not_send_illegal_bearer_header(self, mock_httpx):
+        """When api_key is empty, no Authorization header should be sent."""
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = _response_with_topk()
+        mock_response.raise_for_status = MagicMock()
+        mock_httpx.post.return_value = mock_response
+
+        from hallucination_sentinel.providers.openai_compatible import _call_chat_completions
+
+        _call_chat_completions(
+            base_url="http://localhost:8080/v1",
+            api_key="",
+            model="test-model",
+            messages=[{"role": "user", "content": "hi"}],
+        )
+
+        call_kwargs = mock_httpx.post.call_args
+        headers = call_kwargs[1]["headers"] if "headers" in call_kwargs[1] else call_kwargs[0][2] if len(call_kwargs[0]) > 2 else {}
+        # Must not contain Authorization with empty Bearer
+        assert "Authorization" not in headers
+
+    @patch("hallucination_sentinel.providers.openai_compatible.httpx")
+    def test_nonempty_api_key_sends_bearer_header(self, mock_httpx):
+        """When api_key is present, Authorization: Bearer should be sent."""
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = _response_with_topk()
+        mock_response.raise_for_status = MagicMock()
+        mock_httpx.post.return_value = mock_response
+
+        from hallucination_sentinel.providers.openai_compatible import _call_chat_completions
+
+        _call_chat_completions(
+            base_url="http://localhost:8080/v1",
+            api_key="sk-test-key",
+            model="test-model",
+            messages=[{"role": "user", "content": "hi"}],
+        )
+
+        call_kwargs = mock_httpx.post.call_args
+        headers = call_kwargs[1].get("headers", {})
+        assert headers.get("Authorization") == "Bearer sk-test-key"
 
 
 # ---------------------------------------------------------------------------

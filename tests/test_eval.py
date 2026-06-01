@@ -41,12 +41,14 @@ from hallucination_sentinel.eval import (
     compute_baselines,
     compute_metrics,
     load_eval_data,
+    normalize_to_eval_record,
     report_to_json,
     report_to_markdown,
     save_report_json,
     save_report_markdown,
     split_calibration_eval,
 )
+from hallucination_sentinel.schemas import parse_label
 
 
 # ---------------------------------------------------------------------------
@@ -199,6 +201,129 @@ class TestLoadEvalData:
                 f.write("\n")  # blank line
         loaded = load_eval_data(path)
         assert len(loaded) == 3
+
+
+# ---------------------------------------------------------------------------
+# normalize_to_eval_record
+# ---------------------------------------------------------------------------
+
+class TestNormalizeToEvalRecord:
+    """Tests for the normalize_to_eval_record function."""
+
+    def test_prescored_row_basic(self):
+        """Pre-scored row with all fields produces correct EvalRecord."""
+        obj = {
+            "ces_score": 0.75,
+            "label": 1,
+            "token_count": 10,
+            "token_entropies": [1.0, 2.0, 0.5, 1.5, 0.8, 2.2, 0.3, 1.1, 0.9, 1.7],
+        }
+        rec = normalize_to_eval_record(obj, lineno=1)
+        assert rec.ces_score == 0.75
+        assert rec.label == 1
+        assert rec.token_count == 10
+        assert len(rec.token_entropies) == 10
+        assert rec.calibrated_probability is None
+
+    def test_prescored_row_with_calibrated_probability(self):
+        """Pre-scored row preserves calibrated_probability."""
+        obj = {
+            "ces_score": 0.5,
+            "label": 0,
+            "token_count": 5,
+            "token_entropies": [0.5, 0.6, 0.7, 0.8, 0.9],
+            "calibrated_probability": 0.42,
+        }
+        rec = normalize_to_eval_record(obj, lineno=1)
+        assert rec.calibrated_probability == 0.42
+
+    def test_prescored_row_bool_label_true_is_faithful(self):
+        """bool True -> faithful (label=0)."""
+        obj = {
+            "ces_score": 0.3,
+            "label": True,
+            "token_count": 5,
+            "token_entropies": [0.5] * 5,
+        }
+        rec = normalize_to_eval_record(obj, lineno=1)
+        assert rec.label == 0
+
+    def test_prescored_row_bool_label_false_is_hallucinated(self):
+        """bool False -> hallucinated (label=1)."""
+        obj = {
+            "ces_score": 0.9,
+            "label": False,
+            "token_count": 5,
+            "token_entropies": [2.0] * 5,
+        }
+        rec = normalize_to_eval_record(obj, lineno=1)
+        assert rec.label == 1
+
+    def test_prescored_missing_token_count_raises(self):
+        """Pre-scored row missing token_count raises ValueError."""
+        obj = {
+            "ces_score": 0.5,
+            "label": 1,
+            "token_entropies": [1.0, 2.0],
+        }
+        with pytest.raises(ValueError, match="missing fields"):
+            normalize_to_eval_record(obj, lineno=1)
+
+    def test_prescored_missing_token_entropies_raises(self):
+        """Pre-scored row missing token_entropies raises ValueError."""
+        obj = {
+            "ces_score": 0.5,
+            "label": 1,
+            "token_count": 2,
+        }
+        with pytest.raises(ValueError, match="missing fields"):
+            normalize_to_eval_record(obj, lineno=1)
+
+    def test_raw_entropy_row_with_calibration(self, tmp_path: Path):
+        """Raw entropy row with calibration computes CES."""
+        from hallucination_sentinel.calibration import build_calibration, save_calibration
+
+        rng = np.random.RandomState(42)
+        seqs = [rng.uniform(0.5, 3.0, size=50) for _ in range(20)]
+        artifact = build_calibration(seqs, mode="unsupervised")
+
+        obj = {
+            "entropy": [0.5, 1.2, 2.8, 3.5, 2.1, 0.8],
+            "label": 1,
+        }
+        rec = normalize_to_eval_record(obj, lineno=1, calibration=artifact)
+        assert 0.0 <= rec.ces_score <= 1.0
+        assert rec.label == 1
+        assert rec.token_count == 6
+        assert len(rec.token_entropies) == 6
+
+    def test_raw_entropy_without_calibration_raises(self):
+        """Raw entropy row without calibration raises ValueError."""
+        obj = {
+            "entropy": [0.5, 1.0, 1.5],
+            "label": 0,
+        }
+        with pytest.raises(ValueError, match="requires --calibration"):
+            normalize_to_eval_record(obj, lineno=1, calibration=None)
+
+    def test_neither_entropy_nor_ces_raises(self):
+        """Row with neither 'entropy' nor 'ces_score' raises ValueError."""
+        obj = {"label": 1}
+        with pytest.raises(ValueError, match="ces_score.*entropy"):
+            normalize_to_eval_record(obj, lineno=1, calibration=None)
+
+    def test_empty_entropy_raises(self):
+        """Raw entropy row with empty array raises ValueError."""
+        obj = {"entropy": [], "label": 1}
+        # Need a dummy calibration object to get past the None check
+        with pytest.raises(ValueError, match="requires --calibration"):
+            normalize_to_eval_record(obj, lineno=1, calibration=None)
+
+    def test_missing_label_raises(self):
+        """Row without label raises ValueError."""
+        obj = {"ces_score": 0.5, "token_count": 5, "token_entropies": [1.0] * 5}
+        with pytest.raises(ValueError):
+            normalize_to_eval_record(obj, lineno=1)
 
 
 # ---------------------------------------------------------------------------
@@ -849,3 +974,62 @@ class TestIntegration:
         save_report_markdown(report, tmp_path / "report.md")
         assert (tmp_path / "report.json").exists()
         assert (tmp_path / "report.md").exists()
+
+
+# ---------------------------------------------------------------------------
+# parse_label semantics
+# ---------------------------------------------------------------------------
+
+class TestParseLabel:
+    """Tests for parse_label ensuring calibration and eval agree on positive class."""
+
+    def test_eval_bool_label_true_maps_to_faithful(self):
+        parsed = parse_label(True, context="calibration")
+        assert parsed.faithful is True
+        assert parsed.hallucinated is False
+
+    def test_eval_integer_one_maps_to_hallucinated(self):
+        parsed = parse_label(1, context="eval")
+        assert parsed.hallucinated is True
+
+    def test_bool_false_maps_to_hallucinated(self):
+        parsed = parse_label(False, context="test")
+        assert parsed.faithful is False
+        assert parsed.hallucinated is True
+
+    def test_integer_zero_maps_to_faithful(self):
+        parsed = parse_label(0, context="test")
+        assert parsed.faithful is True
+        assert parsed.hallucinated is False
+
+    def test_string_faithful(self):
+        parsed = parse_label("faithful", context="test")
+        assert parsed.faithful is True
+        assert parsed.hallucinated is False
+
+    def test_string_hallucinated(self):
+        parsed = parse_label("hallucinated", context="test")
+        assert parsed.faithful is False
+        assert parsed.hallucinated is True
+
+    def test_string_case_insensitive(self):
+        assert parse_label("Faithful").faithful is True
+        assert parse_label("HALLUCINATED").hallucinated is True
+        assert parse_label("  Faithful  ").faithful is True
+
+    def test_invalid_int_raises(self):
+        with pytest.raises(ValueError, match="Invalid label integer"):
+            parse_label(2, context="test")
+
+    def test_invalid_string_raises(self):
+        with pytest.raises(ValueError, match="Invalid label string"):
+            parse_label("unknown", context="test")
+
+    def test_unsupported_type_raises(self):
+        with pytest.raises(ValueError, match="Unsupported label type"):
+            parse_label(3.14, context="test")
+
+    def test_parsed_label_is_frozen(self):
+        parsed = parse_label(True)
+        with pytest.raises(AttributeError):
+            parsed.faithful = False  # type: ignore[misc]

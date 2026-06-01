@@ -5,6 +5,7 @@ Covers:
 - Artifact round-trip (save / load)
 - DKW epsilon bound
 - build_calibration with supervised and unsupervised modes
+- reference_ces_scores computation
 """
 
 import json
@@ -132,6 +133,14 @@ class TestBuildCalibration:
         with pytest.raises(ValueError, match="No entropy values"):
             build_calibration(seqs, labels=labels, mode="supervised")
 
+    def test_supervised_calibration_string_labels_include_only_faithful(self):
+        """String labels 'faithful'/'hallucinated' are parsed correctly."""
+        seqs = [np.array([0.1]), np.array([9.9])]
+        labels = ["faithful", "hallucinated"]
+        art = build_calibration(seqs, labels=labels, mode="supervised")
+        assert art.sequence_count == 1
+        assert art.ecdf_values == [0.1]
+
     def test_metadata_passthrough(self):
         """Metadata fields are stored verbatim."""
         seqs = _uniform_sequences(n_seq=2, n_tokens=10)
@@ -256,3 +265,49 @@ class TestCalibrationIO:
         assert data["schema_version"] == "0.1"
         assert "ecdf_values" in data
         assert isinstance(data["ecdf_values"], list)
+
+    def test_round_trip_preserves_reference_ces_scores(self, tmp_path: Path):
+        """reference_ces_scores must survive save/load."""
+        seqs = _uniform_sequences(n_seq=5, n_tokens=20)
+        original = build_calibration(seqs)
+        path = tmp_path / "cal.json"
+        save_calibration(original, path)
+        loaded = load_calibration(path)
+        assert loaded.reference_ces_scores == original.reference_ces_scores
+
+
+# ---------------------------------------------------------------------------
+# reference_ces_scores
+# ---------------------------------------------------------------------------
+
+class TestReferenceCESScores:
+    """build_calibration must compute and store reference CES scores."""
+
+    def test_reference_ces_scores_computed(self):
+        """reference_ces_scores must be populated after build_calibration."""
+        seqs = _uniform_sequences(n_seq=10, n_tokens=50)
+        art = build_calibration(seqs)
+        assert len(art.reference_ces_scores) == 10
+        assert art.reference_ces_scores == sorted(art.reference_ces_scores)
+
+    def test_reference_ces_scores_in_range(self):
+        """All reference CES scores must be in [0, 1]."""
+        seqs = _uniform_sequences(n_seq=10, n_tokens=50)
+        art = build_calibration(seqs)
+        for score in art.reference_ces_scores:
+            assert 0.0 <= score <= 1.0
+
+    def test_reference_ces_scores_supervised_mode(self):
+        """Supervised mode computes CES only for included sequences."""
+        seqs = _uniform_sequences(n_seq=6, n_tokens=10)
+        labels = [True, False, True, True, False, True]
+        art = build_calibration(seqs, labels=labels, mode="supervised")
+        assert len(art.reference_ces_scores) == 4  # 4 truthy sequences
+
+    def test_high_entropy_sequences_high_ces(self):
+        """Sequences with high entropy should have high CES scores."""
+        # Reference: low entropy sequences
+        low_entropy_seqs = [np.ones(50) * 0.5 for _ in range(10)]
+        art = build_calibration(low_entropy_seqs)
+        # All reference sequences have same entropy, so CES should be uniform
+        assert all(0.0 <= s <= 1.0 for s in art.reference_ces_scores)

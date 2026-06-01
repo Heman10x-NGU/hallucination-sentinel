@@ -21,6 +21,8 @@ from typing import Optional
 
 import numpy as np
 
+from .schemas import parse_label
+
 
 SCHEMA_VERSION = "0.1"
 
@@ -67,6 +69,11 @@ class CalibrationArtifact:
     # -- reference ECDF values (sorted entropy samples) ---------------------
     ecdf_values: list = field(default_factory=list)
     # Sorted list of all per-token entropy values from reference sequences.
+
+    # -- reference CES scores (sorted) -------------------------------------
+    reference_ces_scores: list = field(default_factory=list)
+    # Sorted list of CES scores computed for each reference sequence.
+    # Used by thresholds.assign_thresholds to define risk bands in [0,1] space.
 
     # -- threshold quantiles (set by thresholds.assign_thresholds) ----------
     thresholds: dict = field(default_factory=dict)
@@ -174,7 +181,8 @@ def build_calibration(
         # Decide whether to include this sequence in the reference pool
         include = True
         if mode == "supervised" and labels is not None:
-            include = bool(labels[idx])
+            parsed = parse_label(labels[idx], context=f"calibration sequence {idx}")
+            include = parsed.faithful
             if include:
                 faithful_count += 1
         elif mode == "supervised":
@@ -218,9 +226,32 @@ def build_calibration(
         length_summary=_length_summary(sequence_lengths),
         dkw={"confidence": confidence, "epsilon_bound": round(eps, 6)},
         ecdf_values=ecdf_sorted,
+        reference_ces_scores=[],
         thresholds={},
         known_limitations=known_limitations or [],
     )
+
+    # Compute CES for each reference sequence using the artifact's F0.
+    # This avoids importing compute_ces (which would create a circular import).
+    ces_scores: list[float] = []
+    for idx, seq in enumerate(entropy_sequences):
+        seq = np.asarray(seq, dtype=np.float64).ravel()
+        if seq.size == 0:
+            continue
+        include = True
+        if mode == "supervised" and labels is not None:
+            parsed = parse_label(labels[idx], context=f"calibration sequence {idx}")
+            include = parsed.faithful
+        if include:
+            mean_ent = float(np.mean(seq))
+            max_ent = float(np.max(seq))
+            cdf_mean = artifact.f0(mean_ent)
+            cdf_max = artifact.f0(max_ent)
+            ces = math.sqrt(cdf_mean * cdf_max)
+            ces_scores.append(ces)
+
+    artifact.reference_ces_scores = sorted(ces_scores)
+
     return artifact
 
 
@@ -254,6 +285,7 @@ def save_calibration(artifact: CalibrationArtifact, path: str | Path) -> None:
         "length_summary": artifact.length_summary,
         "dkw": artifact.dkw,
         "ecdf_values": artifact.ecdf_values,
+        "reference_ces_scores": artifact.reference_ces_scores,
         "thresholds": artifact.thresholds,
         "known_limitations": artifact.known_limitations,
     }
@@ -293,6 +325,7 @@ def load_calibration(path: str | Path) -> CalibrationArtifact:
         length_summary=data.get("length_summary", {}),
         dkw=data.get("dkw", {}),
         ecdf_values=data.get("ecdf_values", []),
+        reference_ces_scores=data.get("reference_ces_scores", []),
         thresholds=data.get("thresholds", {}),
         known_limitations=data.get("known_limitations", []),
     )

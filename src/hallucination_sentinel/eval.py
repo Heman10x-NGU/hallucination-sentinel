@@ -19,6 +19,8 @@ from typing import Any, Optional
 
 import numpy as np
 
+from .schemas import parse_label
+
 # Optional sklearn dependency
 try:
     from sklearn.metrics import (
@@ -100,10 +102,12 @@ def load_eval_data(path: str | Path) -> list[EvalRecord]:
                     f"Line {lineno}: missing required fields: {sorted(missing)}"
                 )
 
+            parsed = parse_label(obj["label"], context=f"eval line {lineno}")
+
             records.append(
                 EvalRecord(
                     ces_score=float(obj["ces_score"]),
-                    label=int(obj["label"]),
+                    label=1 if parsed.hallucinated else 0,
                     token_count=int(obj["token_count"]),
                     token_entropies=tuple(float(v) for v in obj["token_entropies"]),
                     calibrated_probability=(
@@ -118,6 +122,87 @@ def load_eval_data(path: str | Path) -> list[EvalRecord]:
         raise ValueError(f"No records found in {path}")
 
     return records
+
+
+def normalize_to_eval_record(
+    obj: dict,
+    lineno: int,
+    calibration: Any = None,
+) -> EvalRecord:
+    """Normalize a JSONL dict into an :class:`EvalRecord`.
+
+    Supports two input formats:
+
+    **Pre-scored rows** (all required fields present)::
+
+        {"ces_score": 0.8, "label": 1, "token_count": 10,
+         "token_entropies": [1.2, 0.8, ...]}
+
+    **Raw entropy rows** (requires *calibration* artifact)::
+
+        {"entropy": [1.2, 0.8, 0.5, ...], "label": 1}
+
+    When *calibration* is provided and the row has ``entropy`` but no
+    ``ces_score``, CES is computed on the fly.
+
+    Args:
+        obj: Parsed JSON dict from one JSONL line.
+        lineno: Line number (1-indexed) for error messages.
+        calibration: Optional calibration artifact for computing CES
+            from raw entropy rows.
+
+    Returns:
+        A populated :class:`EvalRecord`.
+
+    Raises:
+        ValueError: If required fields are missing or invalid.
+    """
+    parsed = parse_label(obj.get("label"), context=f"eval line {lineno}")
+
+    # Pre-scored row: has ces_score already
+    if "ces_score" in obj:
+        missing = {"token_count", "token_entropies"} - obj.keys()
+        if missing:
+            raise ValueError(
+                f"Line {lineno}: pre-scored row missing fields: {sorted(missing)}"
+            )
+        return EvalRecord(
+            ces_score=float(obj["ces_score"]),
+            label=1 if parsed.hallucinated else 0,
+            token_count=int(obj["token_count"]),
+            token_entropies=tuple(float(v) for v in obj["token_entropies"]),
+            calibrated_probability=(
+                float(obj["calibrated_probability"])
+                if "calibrated_probability" in obj
+                else None
+            ),
+        )
+
+    # Raw entropy row: needs calibration to compute CES
+    entropy_vals = obj.get("entropy")
+    if entropy_vals is None:
+        raise ValueError(
+            f"Line {lineno}: row must have either 'ces_score' or 'entropy' field."
+        )
+    if calibration is None:
+        raise ValueError(
+            f"Line {lineno}: raw entropy row requires --calibration to compute CES."
+        )
+
+    entropies = tuple(float(v) for v in entropy_vals)
+    if not entropies:
+        raise ValueError(f"Line {lineno}: 'entropy' array is empty.")
+
+    from .ces import compute_ces
+
+    ces_result = compute_ces(np.array(entropies, dtype=np.float64), calibration)
+
+    return EvalRecord(
+        ces_score=float(ces_result.ces_score),
+        label=1 if parsed.hallucinated else 0,
+        token_count=len(entropies),
+        token_entropies=entropies,
+    )
 
 
 # ---------------------------------------------------------------------------
