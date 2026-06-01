@@ -147,7 +147,8 @@ is the ideal case. You get exact entropy (not approximate) from the full
 vocabulary distribution.
 
 This requires:
-- `transformers` and `torch` installed (`pip install hallucination-sentinel[huggingface]`)
+- `transformers` and `torch` installed. From this GitHub repo:
+  `pip install "hallucination-sentinel[huggingface] @ git+https://github.com/Heman10x-NGU/hallucination-sentinel.git"`
 - Enough GPU/CPU memory to load the model
 - A teacher-forced forward pass for arbitrary text scoring
 

@@ -3,9 +3,9 @@
 **Single-pass uncertainty firewall for LLM outputs.**
 
 Flags generations whose entropy profile looks inconsistent with calibrated
-faithful outputs. Uses the Calibrated Entropy Score (CES) algorithm from
-["Entropy Distribution as a Fingerprint for Hallucinations in Generative Models"](https://arxiv.org/abs/2605.28264)
-(Villani et al., 2026).
+faithful outputs. Implements the Calibrated Entropy Score (CES) method from
+Villani et al., 2026:
+["Entropy Distribution as a Fingerprint for Hallucinations in Generative Models"](https://arxiv.org/abs/2605.28264).
 
 ---
 
@@ -45,16 +45,17 @@ The core library requires Python >= 3.10, numpy, scipy, click, and rich.
 ### Install
 
 ```bash
-pip install hallucination-sentinel
+# Install from GitHub
+pip install "git+https://github.com/Heman10x-NGU/hallucination-sentinel.git"
 
 # With OpenAI provider support
-pip install hallucination-sentinel[openai]
+pip install "hallucination-sentinel[openai] @ git+https://github.com/Heman10x-NGU/hallucination-sentinel.git"
 
 # With HuggingFace local model support
-pip install hallucination-sentinel[huggingface]
+pip install "hallucination-sentinel[huggingface] @ git+https://github.com/Heman10x-NGU/hallucination-sentinel.git"
 
 # Everything
-pip install hallucination-sentinel[all]
+pip install "hallucination-sentinel[all] @ git+https://github.com/Heman10x-NGU/hallucination-sentinel.git"
 ```
 
 ### Offline Demo (no API key needed)
@@ -97,11 +98,11 @@ Test whether a provider supports logprobs before relying on it:
 
 ```bash
 # Test OpenAI
-export OPENAI_API_KEY=sk-...
+export OPENAI_API_KEY="<your-openai-api-key>"
 sentinel smoke-provider --provider openai
 
 # Test Together AI
-export TOGETHER_API_KEY=...
+export TOGETHER_API_KEY="<your-together-api-key>"
 sentinel smoke-provider --provider together
 
 # Test a local vLLM server
@@ -157,21 +158,28 @@ print(result.warnings)        # ["short_text: only 6 tokens..."]
 
 ## Middleware / Integration
 
-Gate LLM outputs before your agent or RAG system acts on them:
+Gate LLM outputs before your agent or RAG system acts on them. Production
+integrations must pass real entropy/logprob data from the model provider; plain
+text alone is not enough for CES.
 
 ```python
+import numpy as np
+
 from hallucination_sentinel.calibration import load_calibration
 from hallucination_sentinel.integrations import (
-    guard_output,
+    guard_output_from_entropies,
     TaskCriticality,
-    PolicyAction,
 )
 
 calibration = load_calibration("calibration.json")
 
-decision = guard_output(
+# Compute these from your provider's top-k logprobs or full logits.
+entropies = np.array([0.42, 0.55, 1.80, 2.10, 0.67])
+
+decision = guard_output_from_entropies(
     prompt="What is the capital of France?",
     output="The capital of France is Berlin.",
+    entropies=entropies,
     calibration=calibration,
     provider="openai",
     policy=TaskCriticality.HIGH,
@@ -278,5 +286,5 @@ MIT
 
 ## Acknowledgments
 
-- [Kurate.org](https://kurate.org) for paper rankings
-- The CES paper authors for the algorithm
+This project is an independent implementation of the Calibrated Entropy Score
+method described by Villani et al. in the paper cited above.
