@@ -196,6 +196,41 @@ See `examples/` for:
 - `rag_answer_gate.py` -- RAG pipeline with hallucination gate
 - `agent_tool_preflight.py` -- agent tool-call preflight check
 
+## MCP Server
+
+Hallucination Sentinel can run as an MCP server so agent workspaces can call
+CES scoring tools directly. The MCP server is an integration layer, not a
+text-only hallucination detector: it requires pre-computed entropy values,
+top-k logprobs, or a provider that exposes logprobs.
+
+```bash
+pip install "hallucination-sentinel[mcp] @ git+https://github.com/Heman10x-NGU/hallucination-sentinel.git"
+
+sentinel-mcp --calibration /absolute/path/to/calibration.json
+```
+
+Claude Desktop example:
+
+```json
+{
+  "mcpServers": {
+    "hallucination-sentinel": {
+      "command": "sentinel-mcp",
+      "args": ["--calibration", "/absolute/path/to/calibration.json"]
+    }
+  }
+}
+```
+
+MCP tools:
+- `score_entropy_sequence` -- score pre-computed token entropies
+- `score_topk_logprobs` -- convert top-k logprobs to entropy and score them
+- `score_provider_output` -- score a prompt/output pair through a logprob-capable provider
+- `smoke_provider` -- verify provider logprob support
+- `inspect_calibration` -- inspect calibration metadata
+
+See [docs/mcp.md](docs/mcp.md) for setup, example prompts, and limitations.
+
 ## Limitations
 
 **Read this section before deploying.** Full details: [docs/limitations.md](docs/limitations.md)

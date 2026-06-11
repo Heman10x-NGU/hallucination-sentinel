@@ -34,6 +34,7 @@ dependencies = [
 [project.optional-dependencies]
 openai = [
     "openai>=1.0.0",
+    "httpx>=0.24.0",
 ]
 huggingface = [
     "transformers>=4.30.0",
@@ -42,15 +43,22 @@ huggingface = [
 eval = [
     "scikit-learn>=1.2.0",
 ]
+mcp = [
+    "mcp[cli]>=1.2.0",
+    "httpx>=0.24.0",
+]
 all = [
     "openai>=1.0.0",
+    "httpx>=0.24.0",
     "transformers>=4.30.0",
     "torch>=2.0.0",
     "scikit-learn>=1.2.0",
+    "mcp[cli]>=1.2.0",
 ]
 
 [project.scripts]
 sentinel = "hallucination_sentinel.cli:main"
+sentinel-mcp = "hallucination_sentinel.mcp_server:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
