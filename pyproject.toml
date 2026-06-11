@@ -43,6 +43,9 @@ huggingface = [
 eval = [
     "scikit-learn>=1.2.0",
 ]
+test = [
+    "pytest>=8.0.0",
+]
 mcp = [
     "mcp[cli]>=1.2.0",
     "httpx>=0.24.0",
@@ -53,6 +56,7 @@ all = [
     "transformers>=4.30.0",
     "torch>=2.0.0",
     "scikit-learn>=1.2.0",
+    "pytest>=8.0.0",
     "mcp[cli]>=1.2.0",
 ]
 

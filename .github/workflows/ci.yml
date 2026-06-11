@@ -25,7 +25,7 @@ jobs:
       - name: Install package
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -e ".[eval,mcp]"
+          python -m pip install -e ".[eval,mcp,test]"
 
       - name: Run tests
-        run: pytest -q
+        run: python -m pytest -q
